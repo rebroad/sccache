@@ -69,6 +69,9 @@ Current additional test results on 2026-09-24:
 - Changed path dependency: no restore; clean output matched.
 - Concurrent Redis publication/read: reader restored and reused prior work.
 - Interrupted manifest and index writes: no partial candidate became visible.
+- Archive extraction security: parent traversal, absolute paths, archive
+  symlink entries, and pre-existing symlink escapes are all rejected by focused
+  unit tests without writing outside the private restore directory.
 - Candidate index: newest eight retained; evicted newest entry skipped in favor
   of the next usable candidate.
 - Proc-macro `Span::call_site().file()` output and rustc `file!()` output were

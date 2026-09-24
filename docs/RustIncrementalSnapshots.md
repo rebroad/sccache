@@ -19,6 +19,7 @@
 | Corruption fallback | PASS | `SCCACHE_TEST_CORRUPT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh` |
 | Eviction fallback | PASS | `SCCACHE_TEST_EVICT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh`; bounded-index unit test |
 | Partial-upload visibility safety | PASS | `incomplete_snapshot_upload_is_never_published_as_a_candidate` |
+| Archive path/symlink escape rejection | PASS | `snapshot_rejects_parent_traversal`, `snapshot_rejects_absolute_path`, `snapshot_rejects_archive_symlink_escape`, and `snapshot_rejects_preexisting_symlink_escape` |
 | Feature-change fallback | PASS | Container `SCCACHE_TEST_EXTRA_CFG=1` case; Cargo feature case above |
 | RUSTFLAGS-change fallback | PASS | Container `SCCACHE_TEST_EXTRA_RUSTFLAGS=1` case |
 | Target-triple fallback | PASS | Container `SCCACHE_TEST_TARGET_TRIPLE=i686-unknown-linux-gnu` case |
@@ -589,7 +590,8 @@ prototype must not claim a performance improvement based on these results.
   the snapshot. The `SCCACHE_TEST_RUSTC_REJECT_RESTORED=1` mode verifies this
   path. Archive extraction failures also leave the private state empty.
 - **Security:** archive traversal and pre-existing symlink escapes are covered
-  by `snapshot_rejects_parent_traversal` and
+  by `snapshot_rejects_parent_traversal`, `snapshot_rejects_absolute_path`,
+  `snapshot_rejects_archive_symlink_escape`, and
   `snapshot_rejects_preexisting_symlink_escape`. Serialized compiler state is
   still untrusted input to rustc, so keep the feature opt-in and use only a
   trusted cache until the rustc parser is reviewed.

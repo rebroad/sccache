@@ -443,6 +443,59 @@ mod tests {
         assert!(!restored.path().parent().unwrap().join("escape").exists());
     }
 
+    #[test]
+    fn snapshot_rejects_absolute_path() {
+        let outside = tempfile::tempdir().unwrap();
+        let absolute_path = outside.path().join("escape");
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("placeholder").unwrap();
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        archive.append(&header, &b"x"[..]).unwrap();
+        let mut archive = archive.into_inner().unwrap();
+        archive[..100].fill(0);
+        archive[..absolute_path.as_os_str().len()]
+            .copy_from_slice(absolute_path.to_string_lossy().as_bytes());
+        archive[148..156].fill(b' ');
+        let checksum: u32 = archive[..512].iter().map(|byte| u32::from(*byte)).sum();
+        archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+        let restored = tempfile::tempdir().unwrap();
+
+        assert!(unpack_snapshot(&archive, "probe", restored.path()).is_err());
+        assert!(!absolute_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_archive_symlink_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut symlink = tar::Header::new_gnu();
+        symlink.set_entry_type(tar::EntryType::Symlink);
+        symlink.set_path("probe-hash/link").unwrap();
+        let link_name = outside.path().to_string_lossy().into_owned();
+        symlink.set_link_name(Path::new(&link_name)).unwrap();
+        symlink.set_size(0);
+        symlink.set_mode(0o777);
+        symlink.set_cksum();
+        archive.append(&symlink, &b""[..]).unwrap();
+
+        let mut escaped_file = tar::Header::new_gnu();
+        escaped_file.set_path("probe-hash/link/escaped").unwrap();
+        escaped_file.set_size(1);
+        escaped_file.set_mode(0o600);
+        escaped_file.set_cksum();
+        archive.append(&escaped_file, &b"x"[..]).unwrap();
+        let archive = archive.into_inner().unwrap();
+        let restored = tempfile::tempdir().unwrap();
+
+        assert!(unpack_snapshot(&archive, "probe", restored.path()).is_err());
+        assert!(!outside.path().join("escaped").exists());
+        assert!(!restored.path().join("probe-hash/link").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn snapshot_rejects_preexisting_symlink_escape() {
