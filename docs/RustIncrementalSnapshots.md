@@ -20,6 +20,8 @@
 | Target-triple fallback | PASS |
 | rustc-version-mismatch fallback | PASS |
 | Changed path-dependency fallback | PASS |
+| Proc-macro expansion path behavior | PASS |
+| Debug-info path remapping | PASS |
 | Real-workspace benchmark completed | PASS |
 | Demonstrated performance improvement | INCONCLUSIVE |
 
@@ -40,6 +42,17 @@ benchmark](#real-workspace-benchmark). It uses separate source checkouts and
 empty target roots for each remote case, Redis shared storage, and exact-cache
 dependency restoration. It is a functional PASS, but the measurements do not
 show a net performance improvement.
+
+The path-sensitive proc-macro and debug-info regression is
+`tests/rust-incremental-path-sensitive.sh`. It builds Builder A and B from
+different source roots with fresh target directories, changes the function,
+asserts rustc loaded the snapshot and reused work products, and compares the
+program output with a clean Builder B build. Both `Span::call_site().file()`
+from the proc macro and rustc `file!()` resolve to `src/lib.rs` under the
+explicit logical path remap. `readelf --debug-dump=decodedline` confirms the
+restored binary includes `src/lib.rs` line entries and contains neither
+physical checkout root. This validates the tested remapped debug path; it does
+not prove behavior for every debug format or platform.
 
 Same-checkout, different-checkout, and genuine-reuse PASS evidence:
 `tests/rust-incremental-sccache-poc.sh` (including its
@@ -89,6 +102,9 @@ restore directory removed; the surrounding build retry remains unverified.
 storage failure during manifest upload and during index publication. In both
 cases restore sees no candidate; the latter leaves only an orphaned complete
 immutable object.
+`candidate_index_retains_only_the_most_recent_bounded_set` publishes more than
+eight objects, verifies only the newest eight remain indexed, evicts the newest
+candidate, and verifies restore selects the next valid candidate.
 Remote transfer passes with the repository's Redis backend: Redis contained
 incremental object and index keys, and the consumer's local cache stayed empty.
 Concurrent publishing passes in both backends. The direct script exercises two
@@ -129,7 +145,8 @@ and `RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/
 
 All scenarios above passed on 2026-09-24. These checks cover one Linux host
 architecture and compiler family. Cross-architecture host portability,
-proc-macro output, and debug-info behavior remain unverified.
+other debug formats, and proc macros with additional external state remain
+unverified.
 
 ## Current sccache behavior
 
@@ -512,6 +529,7 @@ review.
 - `tests/rust-incremental-container-reuse.sh`
 - `tests/rust-incremental-fresh-target.sh`
 - `tests/rust-incremental-workspace-benchmark.sh`
+- `tests/rust-incremental-path-sensitive.sh`
 - `docs/RustIncrementalSnapshots.md`
 - `docs/Rust.md`
 - `docs/Configuration.md`

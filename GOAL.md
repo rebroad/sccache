@@ -45,7 +45,13 @@ Current additional test results on 2026-09-24:
 - Changed path dependency: no restore; clean output matched.
 - Concurrent Redis publication/read: reader restored and reused prior work.
 - Interrupted manifest and index writes: no partial candidate became visible.
-- Candidate index: newest eight retained.
+- Candidate index: newest eight retained; evicted newest entry skipped in favor
+  of the next usable candidate.
+- Proc-macro `Span::call_site().file()` output and rustc `file!()` output were
+  compared between restored and clean Builder B builds; both resolved to the
+  remapped `src/lib.rs`.
+- The restored executable's DWARF line table contains `src/lib.rs` and no
+  physical Builder A or Builder B checkout path.
 
 Continue remaining security, portability, and reproducibility work; do not
 rewrite the resolved fresh-builder milestone as a blocker.

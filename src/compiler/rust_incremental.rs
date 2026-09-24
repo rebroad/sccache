@@ -686,6 +686,32 @@ mod tests {
                 .take(MAX_CANDIDATES)
                 .collect::<Vec<_>>()
         );
+        let evicted_id = index.candidates[0].clone();
+        drop(entries);
+
+        let evicted_prefix = object_key("namespace", &evicted_id);
+        let keys = storage
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if key.starts_with(&format!("{evicted_prefix}/")) {
+                storage.0.lock().unwrap().remove(&key);
+            }
+        }
+        let restored = tempfile::tempdir().unwrap();
+        assert!(
+            restore(&storage, "namespace", "probe", restored.path())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(restored.path().join("probe-hash/session/work-product.o")).unwrap(),
+            (MAX_CANDIDATES + 1).to_le_bytes()
+        );
     }
 
     #[tokio::test]
