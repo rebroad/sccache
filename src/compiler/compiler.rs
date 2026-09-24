@@ -744,6 +744,7 @@ where
                         .await;
                 }
 
+                let mut restored_snapshot = false;
                 if let Some(state) = &incremental_state {
                     let should_restore = match std::fs::read_dir(&state.directory) {
                         Ok(entries) => {
@@ -774,6 +775,7 @@ where
                         .await
                         {
                             Ok(true) => {
+                                restored_snapshot = true;
                                 debug!("[{}]: restored Rust incremental snapshot", out_pretty)
                             }
                             Ok(false) => {
@@ -796,7 +798,17 @@ where
                 } else {
                     dist_client
                 };
-                let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
+                let retry = if restored_snapshot {
+                    Some((
+                        compilation.box_clone(),
+                        creator.clone(),
+                        cwd.clone(),
+                        weak_toolchain_key.clone(),
+                    ))
+                } else {
+                    None
+                };
+                let first_compile = dist_or_local_compile(
                     service,
                     compile_dist_client,
                     creator,
@@ -805,8 +817,70 @@ where
                     weak_toolchain_key,
                     out_pretty.clone(),
                 )
-                .await?;
-                let duration_compilation = start.elapsed();
+                .await;
+                let (mut first_compile, mut first_failure) = match first_compile {
+                    Ok(result) => (Some(result), None),
+                    Err(error) if restored_snapshot => match error.downcast::<ProcessError>() {
+                        Ok(ProcessError(output)) => (None, Some(output)),
+                        Err(error) => return Err(error),
+                    },
+                    Err(error) => return Err(error),
+                };
+                let mut duration_compilation = start.elapsed();
+                let returned_failure = first_compile
+                    .as_ref()
+                    .is_some_and(|(_, _, output)| !output.status.success());
+                let retry_required = restored_snapshot && (first_failure.is_some() || returned_failure);
+                let (cacheable, dist_type, compiler_result) = if retry_required {
+                    warn!(
+                        "[{}]: compilation failed after restoring Rust incremental state; retrying without the snapshot",
+                        out_pretty
+                    );
+                    let state = incremental_state
+                        .as_ref()
+                        .expect("restored snapshot must have incremental state");
+                    let (retry_compilation, retry_creator, retry_cwd, retry_key) =
+                        retry.expect("restored snapshot must have a retry compilation");
+                    let failed_output = first_failure
+                        .take()
+                        .or_else(|| first_compile.take().map(|(_, _, output)| output))
+                        .expect("failed compilation must have output");
+                    if let Err(error) = crate::compiler::rust_incremental::discard_crate_state(
+                        &state.directory,
+                        &state.crate_name,
+                    ) {
+                        warn!(
+                            "[{}]: cannot discard rejected Rust incremental state for retry: {error:#}",
+                            out_pretty
+                        );
+                        return Err(ProcessError(failed_output).into());
+                    }
+                    for output in &outputs {
+                        if let Err(error) = std::fs::remove_file(&output.path)
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            warn!(
+                                "[{}]: cannot remove failed output before Rust incremental retry: {error}",
+                                out_pretty
+                            );
+                            return Err(ProcessError(failed_output).into());
+                        }
+                    }
+                    let result = dist_or_local_compile(
+                        service,
+                        None,
+                        retry_creator,
+                        retry_cwd,
+                        retry_compilation,
+                        retry_key,
+                        out_pretty.clone(),
+                    )
+                    .await?;
+                    duration_compilation = start.elapsed();
+                    result
+                } else {
+                    first_compile.expect("successful compile attempt must return a result")
+                };
                 if !compiler_result.status.success() {
                     debug!(
                         "[{}]: Compiled in {}, but failed, not storing in cache",
@@ -1177,6 +1251,8 @@ pub trait Compilation<T>: Send
 where
     T: CommandCreatorSync,
 {
+    fn box_clone(&self) -> Box<dyn Compilation<T>>;
+
     /// Given information about a compiler command, generate a command that can
     /// execute the compiler.
     fn generate_compile_commands(

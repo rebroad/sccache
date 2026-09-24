@@ -43,7 +43,7 @@ pub(crate) async fn restore(
         match unpack_snapshot(&bytes, crate_name, directory) {
             Ok(()) => return Ok(true),
             Err(error) => {
-                let _ = remove_crate_state(directory, crate_name);
+                let _ = discard_crate_state(directory, crate_name);
                 return Err(error);
             }
         }
@@ -202,14 +202,16 @@ fn ensure_no_symlink_ancestors(directory: &Path, relative: &Path) -> Result<()> 
     Ok(())
 }
 
-fn remove_crate_state(directory: &Path, crate_name: &str) -> Result<()> {
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return Ok(());
+pub(crate) fn discard_crate_state(directory: &Path, crate_name: &str) -> Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
     };
     for entry in entries {
         let path = entry?.path();
         if crate_state_path(&path, crate_name) {
-            if path.is_dir() {
+            if std::fs::symlink_metadata(&path)?.file_type().is_dir() {
                 std::fs::remove_dir_all(path)?;
             } else {
                 std::fs::remove_file(path)?;

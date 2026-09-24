@@ -17,6 +17,23 @@ Same-checkout, different-checkout, and genuine-reuse PASS evidence:
 `tests/rust-incremental-sccache-poc.sh` (including its
 `SCCACHE_TEST_ABSOLUTE_INPUT=1` mode) with rustc 1.98.1 on x86_64 Linux. The
 test uses `-Z assert-incr-state=loaded` and reports hard-linked work products.
+The retry path is exercised by
+`SCCACHE_TEST_RUSTC_REJECT_RESTORED=1 tests/rust-incremental-sccache-poc.sh`:
+the test makes rustc fail after it loads the restored work products, then
+verifies sccache discards that crate's private state, retries successfully, and
+matches a clean build. This tests sccache's retry handling with rustc's
+diagnostic assertion; it does not simulate arbitrary incremental-format
+corruption inside rustc.
+The verified retry command used was:
+
+```sh
+TMPDIR=/var/tmp \
+SCCACHE_TEST_RUSTC_REJECT_RESTORED=1 \
+RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+tests/rust-incremental-sccache-poc.sh
+```
+
 Cargo's different-checkout PASS evidence, including `file!()`, generated source,
 build-script `OUT_DIR`, and `CARGO_MANIFEST_DIR`, is
 `tests/rust-incremental-cargo-poc.sh` with Cargo and rustc both pinned to
@@ -34,8 +51,9 @@ successful build with a clean output. Eviction fallback passes in
 `immutable_publication_restores_and_skips_evicted_or_corrupt_objects`
 from `cargo test --lib rust_incremental::tests`: removing a referenced object
 returns a normal miss, and corrupt bytes under its immutable id are skipped
-without populating the private directory. A successful retry after rustc itself
-rejects a structurally valid but incompatible snapshot remains unverified.
+without populating the private directory. A successful retry after rustc exits
+unsuccessfully on restored state passes through the assertion mode above;
+arbitrary compiler ICEs or format-specific rejections remain untested.
 `truncated_snapshot_with_valid_object_id_is_rejected_cleanly` also verifies a
 truncated tar whose digest matches its published id is rejected and its private
 restore directory removed; the surrounding build retry remains unverified.
@@ -185,8 +203,10 @@ exact-output lookup first. On an exact miss only:
 3. Restore into a private incremental directory. Never run rustc against a
    remote/shared mutable directory.
 4. Let rustc load, reject, or invalidate that state normally. Archive and digest
-   failures discard the private copy and continue with empty state. Rustc-level
-   rejection retry remains to be tested.
+   failures discard the private copy and continue with empty state. If rustc
+   exits unsuccessfully after loading a restored snapshot, sccache discards the
+   crate state and partial outputs, then retries once without the snapshot;
+   this path is exercised with rustc's `assert-incr-state` diagnostic.
 5. After success, publish a complete immutable snapshot object, then update the
    bounded candidate index. Readers must never use a partial upload.
 
@@ -323,8 +343,10 @@ real-workspace benchmark. It proves state loading and work-product reuse only.
 ## Risks and remaining measurements
 
 - **Correctness:** always restore privately and trust rustc's compatibility
-  checks. A failed/partial restore must degrade to an empty state, never reuse
-  outputs based only on the sccache namespace.
+  checks. If rustc exits unsuccessfully after a snapshot restore, sccache
+  discards that crate's state and partial outputs, then retries once without
+  the snapshot. The `SCCACHE_TEST_RUSTC_REJECT_RESTORED=1` mode verifies this
+  path. Archive extraction failures also leave the private state empty.
 - **Security:** archive traversal and pre-existing symlink escapes are covered
   by `snapshot_rejects_parent_traversal` and
   `snapshot_rejects_preexisting_symlink_escape`. Serialized compiler state is
@@ -357,6 +379,7 @@ review.
 ## Files changed in this prototype
 
 - `GOAL.md`
+- `src/compiler/c.rs`
 - `src/compiler/compiler.rs`
 - `src/compiler/rust.rs`
 - `src/compiler/rust_incremental.rs`

@@ -15,14 +15,38 @@ cleanup() {
         for log in "$root/first.log" "$root/same-checkout.log" "$root/second.log" \
             "$root/concurrent-a.log" "$root/concurrent-b.log" "$root/concurrent-reader.log"; do
             if [[ -f "$log" ]]; then
-                cat "$log" >&2
+                echo "--- $(basename "$log"): relevant diagnostics ---" >&2
+                rg 'restored Rust incremental|retrying without|asserted that the incremental cache|hard-linked|completely ignoring cache|error:|CompileFailed' "$log" >&2 || true
             fi
         done
+    fi
+    if [[ "${SCCACHE_TEST_KEEP_TMP:-0}" == 1 && "$status" -ne 0 ]]; then
+        echo "kept incremental probe workspace at $root" >&2
+        exit "$status"
     fi
     rm -rf "$root"
     exit "$status"
 }
 trap cleanup EXIT
+
+if [[ ${SCCACHE_TEST_RUSTC_REJECT_RESTORED:-0} == 1 ]]; then
+    cat > "$root/rustc-capture-rejection" <<SH
+#!/usr/bin/env bash
+args=" \$* "
+if [[ "\$args" == *assert-incr-state=not-loaded* && "\$args" == *incremental=incremental* ]]; then
+    stderr_file="$root/rustc.stderr.\$\$"
+    "$rustc_bin" "\$@" 2>"\$stderr_file"
+    status=\$?
+    cat "\$stderr_file" >> "$root/rejected-rustc.stderr"
+    cat "\$stderr_file" >&2
+    rm -f "\$stderr_file"
+    exit "\$status"
+fi
+exec "$rustc_bin" "\$@"
+SH
+    chmod +x "$root/rustc-capture-rejection"
+    rustc_bin="$root/rustc-capture-rejection"
+fi
 
 source_arg() {
     local checkout=$1
@@ -102,9 +126,13 @@ fi
     sed -i 's/f64() -> u32 { 64 }/f64() -> u32 { 640 }/' lib.rs
     rm -rf incremental
     mkdir -p out
+    second_assert_state=loaded
+    if [[ ${SCCACHE_TEST_RUSTC_REJECT_RESTORED:-0} == 1 ]]; then
+        second_assert_state=not-loaded
+    fi
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
-        -Z assert-incr-state=loaded -C incremental=incremental \
+        -Z "assert-incr-state=$second_assert_state" -C incremental=incremental \
         --out-dir out "$(source_arg checkout-b)" 2> "$root/second.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
@@ -112,7 +140,16 @@ fi
 )
 
 grep -F 'restored Rust incremental snapshot' "$root/second.log" >/dev/null
-grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/second.log"
+if [[ ${SCCACHE_TEST_RUSTC_REJECT_RESTORED:-0} == 1 ]]; then
+    grep -F 'compilation failed after restoring Rust incremental state; retrying without the snapshot' \
+        "$root/second.log" >/dev/null
+    grep -F 'asserted that the incremental cache should not be loaded, but it was loaded' \
+        "$root/rejected-rustc.stderr" >/dev/null
+    grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/rejected-rustc.stderr"
+    echo "rustc rejected the restored state; sccache retried clean and matched a clean build"
+else
+    grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/second.log"
+fi
 if grep -F 'completely ignoring cache' "$root/second.log" >/dev/null; then
     echo "rustc rejected the cross-checkout incremental state" >&2
     exit 1

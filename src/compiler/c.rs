@@ -134,6 +134,7 @@ impl ParsedArguments {
 }
 
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
+#[derive(Clone)]
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
@@ -1195,6 +1196,10 @@ fn include_is_too_new(
 const PREPROCESSING_SKIPPED_COMPILE_POISON: &[u8] = b"([{SCCACHE -*-* INVALID_C_CPP_CODE([{\"";
 
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
+    fn box_clone(&self) -> Box<dyn Compilation<T>> {
+        Box::new(self.clone())
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,

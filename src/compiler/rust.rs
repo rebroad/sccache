@@ -1861,6 +1861,10 @@ where
 }
 
 impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
+    fn box_clone(&self) -> Box<dyn Compilation<T>> {
+        Box::new(self.clone())
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
