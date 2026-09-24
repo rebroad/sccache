@@ -14,10 +14,10 @@ root=$(cd "$root" && pwd -P)
 cleanup() {
     local status=$?
     if [[ "$status" -ne 0 ]]; then
-        for log in "$root"/{a,b,c,clean,clean-c}.log; do
+        for log in "$root"/{a,b,c,d,clean,clean-c,clean-d}.log; do
             if [[ -f "$log" ]]; then
                 echo "--- $(basename "$log"): relevant diagnostics ---" >&2
-                rg 'predecessor namespace=|restored Rust incremental|no Rust incremental|Cache hit|files hard-linked|asserted that the incremental cache|completely ignoring cache|retrying without|error:|Finished' "$log" >&2 || true
+                rg 'predecessor namespace=|predecessor details:|compatibility inputs:|restored Rust incremental|no Rust incremental|Cache hit|files hard-linked|asserted that the incremental cache|completely ignoring cache|retrying without|error:|Finished' "$log" >&2 || true
             fi
         done
         echo "kept fresh-target reproduction at $root" >&2
@@ -157,7 +157,7 @@ export RUSTC_WRAPPER="$root/rustc-wrapper"
 export RUSTC="$rustc_bin"
 export SCCACHE_BIN="$sccache_bin"
 export SCCACHE_ASSERT_INCR_STATE=not-loaded
-export SCCACHE_LOG=debug
+export SCCACHE_LOG=trace
 export RUSTFLAGS='-Z remap-cwd-prefix=/sccache-fresh-target -Z incremental-info'
 
 (
@@ -188,6 +188,24 @@ generated_hash_b=$(sha256sum "$generated_b" | cut -d ' ' -f 1)
 [[ "$generated_hash_a" != "$generated_hash_b" ]]
 
 grep -F '[stable_dependency]: Cache hit' "$root/b.log" >/dev/null
+grep -F '[fresh_target_probe]: Rust incremental compatibility inputs:' "$root/a.log" >/dev/null
+grep -F '[fresh_target_probe]: Rust incremental compatibility inputs:' "$root/b.log" >/dev/null
+grep -F 'tracked_environment_value_digests=' "$root/b.log" >/dev/null
+generated_out_a=$(grep -F '[generated_dependency]: Rust incremental compatibility inputs:' "$root/a.log" \
+    | grep -oE 'OUT_DIR:[0-9a-f]{64}' | tail -1)
+generated_out_b=$(grep -F '[generated_dependency]: Rust incremental compatibility inputs:' "$root/b.log" \
+    | grep -oE 'OUT_DIR:[0-9a-f]{64}' | tail -1)
+[[ -n "$generated_out_a" && -n "$generated_out_b" && "$generated_out_a" != "$generated_out_b" ]]
+for log in "$root/a.log" "$root/b.log"; do
+    identity_details=$(grep -F '[fresh_target_probe]: Rust incremental predecessor details:' "$log" | tail -1)
+    for field in cargo_output_ids_excluded physical_cargo_env_excluded dependency_artifacts \
+        logical_name=generated_dependency path= filename= byte_digest= digest_in_namespace=false; do
+        if [[ "$identity_details" != *"$field"* ]]; then
+            echo "predecessor diagnostics are missing $field in $(basename "$log")" >&2
+            exit 1
+        fi
+    done
+done
 grep -F '[fresh_target_probe]: restored Rust incremental snapshot' "$root/b.log" >/dev/null
 grep -F 'session directory:' "$root/b.log" | grep -Eq '[1-9][0-9]* files hard-linked'
 if grep -F '[fresh_target_probe]: completely ignoring cache' "$root/b.log" >/dev/null; then
@@ -277,6 +295,15 @@ printf 'Cargo feature change selected a distinct namespace and matched a clean o
 
 printf 'Builder B exact dependency cache hit: '
 grep -F '[stable_dependency]: Cache hit' "$root/b.log" | head -1
+printf 'Builder A structured predecessor identity inputs: '
+grep -F '[fresh_target_probe]: Rust incremental compatibility inputs:' "$root/a.log" | head -1
+printf 'Builder B structured predecessor identity inputs: '
+grep -F '[fresh_target_probe]: Rust incremental compatibility inputs:' "$root/b.log" | head -1
+printf 'OUT_DIR env! values are tracked but omitted from predecessor identity: %s vs %s\n' \
+    "$generated_out_a" "$generated_out_b"
+printf 'Dependency artifact identity diagnostics (A then B):\n'
+grep -F '[fresh_target_probe]: Rust incremental predecessor details:' "$root/a.log" | tail -1
+grep -F '[fresh_target_probe]: Rust incremental predecessor details:' "$root/b.log" | tail -1
 printf 'sccache-restored stable dependency digest: %s\n' "$stable_hash_b"
 printf 'OUT_DIR-dependent dependency artifact digests differ across target roots: %s %s\n' \
     "$generated_hash_a" "$generated_hash_b"

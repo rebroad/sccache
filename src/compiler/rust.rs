@@ -1795,6 +1795,58 @@ where
                 });
             }
             let namespace = snapshot.finish();
+            let argument_fingerprints = self
+                .parsed_args
+                .arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let label = match argument.get_data() {
+                        Some(CodeGen(arg)) => format!("-C {}", arg.opt),
+                        Some(Unstable(arg)) => format!("-Z {}", arg.opt),
+                        Some(Extern(_)) => "--extern".to_owned(),
+                        Some(OutDir(_)) => "--out-dir".to_owned(),
+                        Some(Target(_)) => "--target".to_owned(),
+                        Some(Emit(_)) => "--emit".to_owned(),
+                        Some(LinkPath(_)) => "-L".to_owned(),
+                        Some(CrateName(_)) => "--crate-name".to_owned(),
+                        Some(CrateType(_)) => "--crate-type".to_owned(),
+                        _ => format!("argument#{index}"),
+                    };
+                    if let Some(reason) = incremental_argument_skip_reason(
+                        argument,
+                        &self.parsed_args.input,
+                        self.parsed_args.target_json.is_some(),
+                    ) {
+                        return format!("{label}:skipped:{reason}");
+                    }
+                    let mut fingerprint = Digest::new();
+                    argument
+                        .to_os_string()
+                        .hash(&mut HashToDigest {
+                            digest: &mut fingerprint,
+                        });
+                    if let Some(value) = argument.get_data() {
+                        value
+                            .clone()
+                            .into_arg_os_string()
+                            .hash(&mut HashToDigest {
+                                digest: &mut fingerprint,
+                            });
+                    }
+                    format!("{label}:included:{}", fingerprint.finish())
+                })
+                .collect::<Vec<_>>();
+            let tracked_env_fingerprints = env_deps
+                .iter()
+                .map(|(name, value)| {
+                    let mut fingerprint = Digest::new();
+                    value.hash(&mut HashToDigest {
+                        digest: &mut fingerprint,
+                    });
+                    format!("{}:{}", name.to_string_lossy(), fingerprint.finish())
+                })
+                .collect::<Vec<_>>();
             debug!(
                 "[{}]: Rust incremental predecessor namespace={} rustc_version={} rustc_host={} target_args={:?} extern_names={:?} extern_artifacts={} (artifact digests omitted from predecessor identity) skipped_arguments={:?} skipped_cargo_env={:?}",
                 self.parsed_args.crate_name,
@@ -1833,6 +1885,12 @@ where
                         digest
                     ))
                     .collect::<Vec<_>>()
+            );
+            trace!(
+                "[{}]: Rust incremental compatibility inputs: rustc_arguments={:?}; tracked_environment_value_digests={:?}",
+                self.parsed_args.crate_name,
+                argument_fingerprints,
+                tracked_env_fingerprints,
             );
             namespace
         });

@@ -40,6 +40,7 @@ docker run --rm --network host \
     -v "$sccache_bin:/usr/local/bin/sccache:ro" \
     -v "$repo/tests/rust-incremental-sccache-poc.sh:/tmp/producer.sh:ro" \
     -e "SCCACHE_REDIS=$redis_url" -e SCCACHE_BIN=/usr/local/bin/sccache \
+    -e "SCCACHE_IN_PROCESS=${SCCACHE_IN_PROCESS:-0}" \
     -e RUSTC_BIN=/toolchain/bin/rustc \
     -e SCCACHE_TEST_ABSOLUTE_INPUT="${SCCACHE_TEST_ABSOLUTE_INPUT:-0}" \
     "$image" bash /tmp/producer.sh
@@ -94,6 +95,7 @@ docker run --rm --network host \
     -v "$sccache_bin:/usr/local/bin/sccache:ro" \
     -v "$repo/tests/rust-incremental-container-consumer.sh:/tmp/consumer.sh:ro" \
     -e "SCCACHE_REDIS=$redis_url" \
+    -e "SCCACHE_IN_PROCESS=${SCCACHE_IN_PROCESS:-0}" \
     -e SCCACHE_TEST_ABSOLUTE_INPUT="${SCCACHE_TEST_ABSOLUTE_INPUT:-0}" \
     -e SCCACHE_TEST_EXPECT_RESTORE="$consumer_restore" \
     -e SCCACHE_TEST_EXTRA_CFG="${SCCACHE_TEST_EXTRA_CFG:-0}" \

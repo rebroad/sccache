@@ -1,30 +1,32 @@
 # Rust incremental snapshot investigation
 
-| Capability | Status |
-| --- | --- |
-| Same-checkout incremental restore | PASS |
-| Different-checkout restore | PASS |
-| Genuine rustc work reuse | PASS |
-| Remote storage transfer | PASS |
-| Separate-filesystem/container reuse | PASS |
-| Fresh target-root predecessor discovery | PASS |
-| Fresh-builder real-workspace reuse | PASS |
-| Cargo feature-change namespace fallback | PASS |
-| Immutable snapshot publication | PASS |
-| Bounded candidate lookup | PASS |
-| Concurrent publishing | PASS |
-| Corruption fallback | PASS |
-| Eviction fallback | PASS |
-| Partial-upload visibility safety | PASS |
-| Feature-change fallback | PASS |
-| RUSTFLAGS-change fallback | PASS |
-| Target-triple fallback | PASS |
-| rustc-version-mismatch fallback | PASS |
-| Changed path-dependency fallback | PASS |
-| Proc-macro expansion path behavior | PASS |
-| Debug-info path remapping | PASS |
-| Real-workspace benchmark completed | PASS |
-| Demonstrated performance improvement | FAIL (tested workspace) |
+| Capability | Status | Evidence |
+| --- | --- | --- |
+| Same-checkout incremental restore | PASS | `tests/rust-incremental-sccache-poc.sh` |
+| Different-checkout restore | PASS | `tests/rust-incremental-sccache-poc.sh`; `SCCACHE_TEST_ABSOLUTE_INPUT=1` variant |
+| Genuine rustc work reuse | PASS | Both scripts above assert rustc loaded state and report hard-linked work products |
+| Remote storage transfer | PASS | `tests/rust-incremental-container-reuse.sh` with Redis |
+| Separate-filesystem/container reuse | PASS | `tests/rust-incremental-container-reuse.sh` |
+| Fresh target-root predecessor discovery | PASS | `tests/rust-incremental-fresh-target.sh` |
+| Fresh-builder real-workspace reuse | PASS | `tests/rust-incremental-workspace-benchmark.sh` |
+| Dependency identity diagnostics | PASS | `tests/rust-incremental-fresh-target.sh` (trace assertions for `OUT_DIR`, paths, filenames, and artifact digests) |
+| Sandbox build without daemon IPC | PASS | Fresh-target test with `SCCACHE_IN_PROCESS=1`; Redis container test with mode propagated to both builders |
+| Cargo feature-change namespace fallback | PASS | `tests/rust-incremental-fresh-target.sh` Builder D case |
+| Immutable snapshot publication | PASS | `cargo test --lib rust_incremental::tests` |
+| Bounded candidate lookup | PASS | `candidate_index_retains_only_the_most_recent_bounded_set` |
+| Concurrent publishing | PASS | `tests/rust-incremental-sccache-poc.sh`; Redis race in `tests/rust-incremental-container-reuse.sh` |
+| Corruption fallback | PASS | `SCCACHE_TEST_CORRUPT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh` |
+| Eviction fallback | PASS | `SCCACHE_TEST_EVICT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh`; bounded-index unit test |
+| Partial-upload visibility safety | PASS | `incomplete_snapshot_upload_is_never_published_as_a_candidate` |
+| Feature-change fallback | PASS | Container `SCCACHE_TEST_EXTRA_CFG=1` case; Cargo feature case above |
+| RUSTFLAGS-change fallback | PASS | Container `SCCACHE_TEST_EXTRA_RUSTFLAGS=1` case |
+| Target-triple fallback | PASS | Container `SCCACHE_TEST_TARGET_TRIPLE=i686-unknown-linux-gnu` case |
+| rustc-version-mismatch fallback | PASS | Container `SCCACHE_TEST_RUSTC_VERSION_MISMATCH=1` case |
+| Changed path-dependency fallback | PASS | `tests/rust-incremental-cargo-poc.sh` |
+| Proc-macro expansion path behavior | PASS | `tests/rust-incremental-path-sensitive.sh` |
+| Debug-info path remapping | PASS | `tests/rust-incremental-path-sensitive.sh` |
+| Real-workspace benchmark completed | PASS | Three-round `tests/rust-incremental-workspace-benchmark.sh` run below |
+| Demonstrated performance improvement | FAIL (tested workspace) | Three-round repeated benchmark below; 9.2–10.7× slower for remote edits |
 
 Every PASS below names its automated test or command. The container evidence is
 for separate Linux filesystems with the same host/target triple and toolchain;
@@ -43,6 +45,18 @@ build. Builder B has an empty target at startup; restoring dependency artifacts
 through ordinary exact sccache hits is explicitly allowed and expected. The
 test proves those hits materialize dependencies into Builder B's fresh target
 without inheriting Builder A's live target tree.
+
+With trace logging enabled, the same test emits predecessor input diagnostics:
+compiler arguments have per-option fingerprints, rustc-tracked environment
+values have per-variable digests, and extern records show logical names,
+physical paths, filenames, and artifact byte digests. Values of tracked
+environment variables are not printed. In the minimal reproduction, the
+`OUT_DIR` digest and generated dependency artifact digest differ between A and
+B, while the dependent app's namespace is unchanged. Its restored output
+matches a clean build and rustc reuses work products. The stable dependency
+also produces a normal exact-cache hit into B's initially empty target; the
+generated dependency's `OUT_DIR`-dependent exact-output key changes, so sccache
+invokes rustc with a private incremental predecessor for that crate as well.
 
 The real-workspace command and data are recorded under [real-workspace
 benchmark](#real-workspace-benchmark). It uses separate source checkouts and
@@ -244,6 +258,32 @@ example enables that compiler flag with the tested stable toolchain; use a
 nightly toolchain instead if preferred. The in-process switch is only needed
 when a sandbox blocks local IPC: add `SCCACHE_IN_PROCESS=1` in that case.
 
+This was verified in the restricted Codex shell: the host's system sccache
+0.10 daemon attempt failed with `Operation not permitted`, while the fork's
+sccache 0.18 completed the fresh-target Cargo regression with
+`SCCACHE_IN_PROCESS=1`. The Redis container regression also passes with this
+setting propagated to both builders; those sccache processes talk directly to
+the configured Redis backend and do not depend on Codex-provided local IPC.
+The Docker orchestration itself required access to the host Docker socket.
+
+The in-process fresh-target command was:
+
+```sh
+TMPDIR=/var/tmp SCCACHE_IN_PROCESS=1 \
+CARGO_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo \
+RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+tests/rust-incremental-fresh-target.sh
+```
+
+The separate-container Redis command was:
+
+```sh
+TMPDIR=/var/tmp SCCACHE_IN_PROCESS=1 \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+tests/rust-incremental-container-reuse.sh
+```
+
 The checked-in test passes the input as relative `lib.rs` from each checkout's
 own working directory, then compares the program output against a clean build.
 This keeps the physical checkout roots different while rustc sees the same
@@ -261,10 +301,10 @@ mapping and query validation preserve the current checkout's observable path.
 
 The Cargo test verifies that `CARGO_MANIFEST_DIR`, `OUT_DIR`, a build-script
 export derived from `OUT_DIR`, generated-source `file!()`, and source `file!()`
-match a clean build in checkout B after snapshot restore. Proc-macro output,
-debug information, and path dependencies still need dedicated tests. Rustc's
-incremental query validation must be allowed to invalidate path-sensitive
-queries; the remap flag is not a substitute for those checks.
+match a clean build in checkout B after snapshot restore. Dedicated proc-macro,
+debug-info, and changed-path-dependency tests are listed in the status table.
+Rustc's incremental query validation must be allowed to invalidate
+path-sensitive queries; the remap flag is not a substitute for those checks.
 `-Z remap-cwd-prefix` can change the value observable by programs and users
 must account for that behavior.
 
@@ -279,7 +319,10 @@ exact-output lookup first. On an exact miss only:
 
 1. Derive a conservative compatibility namespace from compiler identity and
    host triple, crate identity, target, options/profile/features, relevant
-   environment and dependency identity.
+   environment and logical extern-crate names. Physical dependency artifact
+   paths, filenames, and byte digests are diagnostic-only: fresh targets can
+   change them (notably through `OUT_DIR`), and rustc validates dependency
+   compatibility after restore.
 2. Look up up to eight predecessor ids in a bounded candidate index. The
    namespace does not require Git ancestry. Rustc-tracked environment
    dependencies are left for rustc to revalidate after restore.
@@ -318,9 +361,11 @@ Rustc's saved option hash is a necessary final check, not a sufficient sccache
 namespace: it does not promise to encode host CPU/OS compatibility or protect
 the snapshot transport. The current namespace includes rustc version, host
 triple, crate name, compiler options, tracked Cargo configuration variables,
-dependency digests, and the compiler shared-library identity. Environment
-dependencies reported by rustc dep-info remain in the exact-output key and are
-revalidated by rustc after restore. `CARGO_MANIFEST_DIR` and
+logical extern-crate names, and compiler shared-library identity. Dependency
+artifact paths, filenames, and byte digests are logged at trace level but do
+not enter predecessor identity. Environment dependencies reported by rustc
+dep-info remain in the exact-output key and are revalidated by rustc after
+restore. `CARGO_MANIFEST_DIR` and
 `CARGO_MANIFEST_PATH` are omitted from the predecessor namespace because they
 name the physical checkout; they remain in the exact-output key. The Cargo
 integration test demonstrates path-sensitive values from the checkout and
@@ -553,9 +598,11 @@ prototype must not claim a performance improvement based on these results.
   target triples passed. This does not prove other kernel, OS, CPU-feature, or
   architecture combinations. x86_64-host to aarch64-target is not equivalent
   to aarch64-host to aarch64-target.
-- **Cost:** a real workspace was measured. Snapshot transfer and writes are
-  large, and current separated runs do not prove a speedup. A controlled
-  repeated benchmark is still needed before making a performance claim.
+- **Cost:** a controlled three-round real-workspace benchmark is recorded
+  above. Snapshot transfer and writes are large, and remote edits were 9.2–10.7×
+  slower than local incremental edits for this workspace/configuration. This is
+  a measured performance failure here; no broader backend/workspace claim is
+  justified.
 
 ## Upstreaming boundary
 

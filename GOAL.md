@@ -46,6 +46,17 @@ Current additional test results on 2026-09-24:
   matched. The fresh-target test also proves Builder B starts without
   Builder A's target tree and reconstructs dependencies through ordinary exact
   sccache hits; this is allowed and expected by the goal.
+- Structured predecessor diagnostics now expose compiler-argument fingerprints,
+  tracked environment-value digests, Cargo output identity exclusions, and
+  dependency artifact logical names, paths, filenames, and byte digests. The
+  minimal Cargo test proves `OUT_DIR` values and generated dependency artifact
+  digests differ across targets while the app namespace remains equal and
+  rustc accepts/reuses the restored state.
+- Sandbox IPC: the focused fresh-target test passes under the current restricted
+  Codex shell with `SCCACHE_IN_PROCESS=1`; the system sccache 0.10 daemon path
+  fails there with `Operation not permitted`, while this fork's sccache 0.18
+  in-process path builds without daemon IPC or bwrap changes. The Redis
+  container regression also passes with this mode propagated to both builders.
 - Changed `RUSTFLAGS`: safe no-restore fallback, clean output matched.
 - Changed target triple to i686 on the same x86_64 host: no restore; clean
   target output verified.
@@ -338,8 +349,8 @@ for the changed crate, discovers a compatible incremental predecessor,
 restores it privately, and rustc demonstrably reuses prior work while
 producing output matching a clean build.
 
-The remaining questions are:
-
-    Which required configuration, corruption, eviction, concurrency, and
-    platform cases remain unverified, and what controlled repeated benchmark
-    is needed to assess performance?
+The required same-host configuration, corruption, eviction, concurrency, and
+controlled benchmark cases are now recorded above and in
+`docs/RustIncrementalSnapshots.md`. Remaining portability limits are other
+operating systems and host architectures; the measured performance result is
+FAIL for the tested workspace/configuration and must remain reported that way.
