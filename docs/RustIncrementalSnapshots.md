@@ -438,6 +438,22 @@ cache hits. Each remote edit restored 260 hard-linked rustc work products.
 | Remote small edit | 119.504 | 88.778 | restored 364,955,648 B; fetch 2,319.290 ms; unpack 242.974 ms; uploaded compressed payload 191,436,447 B |
 | Remote moderate edit | 123.705 | 94.761 | restored 730,066,432 B; fetch 4,487.078 ms; unpack 550.708 ms; uploaded compressed payload 191,824,058 B |
 
+Redis byte totals include exact-cache artifacts, metadata, and protocol overhead;
+the compressed snapshot payload column above isolates the v4 snapshot records.
+The final dataset is the measured Redis string payload size after each case.
+
+| Remote case | Raw snapshot published | Raw snapshot restored | Snapshot payload written | Redis bytes uploaded | Redis bytes downloaded | Redis dataset after case |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Seed miss | 364,955,648 B | 0 B | 95,637,953 B | 415,484,270 B | 19,615 B | 410,315,692 B |
+| Small edit | 730,066,432 B | 364,955,648 B | 191,436,447 B | 322,187,157 B | 284,753,999 B | 732,487,078 B |
+| Moderate edit | 731,663,360 B | 730,066,432 B | 191,824,058 B | 317,804,806 B | 385,449,708 B | 1,050,276,075 B |
+
+The exact-cache baseline's local cache directory was 312,016,704 B. In the
+remote cases, the per-builder local cache directories were empty; Redis held
+the shared cache dataset shown above. Each edit reused 260 hard-linked
+work-product files. The moderate edit restored a larger prior snapshot because
+the preceding small edit had itself published updated compiler state.
+
 Remote incremental results are from a later run after the baseline run; do
 not compare these as a controlled performance trial. The run confirms correct
 discovery, transfer, restore, and reuse; it does not establish a net speedup.
