@@ -12,6 +12,16 @@ rustc_bin=${RUSTC_BIN:-rustc}
 sccache_bin=${SCCACHE_BIN:-/mnt/kingston/builds/rebroad/src/sccache-bench.build/target/debug/sccache}
 build_root=${BENCH_BUILD_ROOT:-/mnt/kingston/builds/rebroad/src/sccache-bench.build}
 test -x "$sccache_bin"
+repeats=${BENCH_REPEATS:-1}
+comparison_only=${BENCH_COMPARISON_ONLY:-0}
+if [[ ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
+    echo "BENCH_REPEATS must be a positive integer." >&2
+    exit 2
+fi
+if [[ "$comparison_only" != 0 && "$comparison_only" != 1 ]]; then
+    echo "BENCH_COMPARISON_ONLY must be 0 or 1." >&2
+    exit 2
+fi
 
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 results="$build_root/workspace-benchmark-$run_id"
@@ -81,9 +91,7 @@ run_build() {
         export RUSTC="$rustc_bin"
         export RUSTFLAGS='-Z remap-cwd-prefix=/sccache-workspace -Z incremental-info -Z time-passes'
         if [[ "$remote" == 1 && "${BENCH_PATH_REMAP:-0}" == 1 ]]; then
-            export RUSTFLAGS+=" --remap-path-prefix=$scratch/remote-a=/sccache-workspace"
-            export RUSTFLAGS+=" --remap-path-prefix=$scratch/remote-small=/sccache-workspace"
-            export RUSTFLAGS+=" --remap-path-prefix=$scratch/remote-moderate=/sccache-workspace"
+            export RUSTFLAGS+=" --remap-path-prefix=$source=/sccache-workspace"
             export RUSTFLAGS+=" --remap-path-prefix=$target=/sccache-target"
         fi
         export CARGO_INCREMENTAL=$incremental
@@ -156,23 +164,16 @@ printf 'workspace packages: ' | tee -a "$results/toolchain.txt"
 RUSTC_WRAPPER= "$cargo_bin" metadata --locked --no-deps --format-version 1 |
     python3 -c 'import json,sys; d=json.load(sys.stdin); print(", ".join(p["name"] for p in d["packages"]))' |
     tee -a "$results/toolchain.txt"
-
-if [[ "${BENCH_REMOTE_ONLY:-0}" != 1 ]]; then
-    copy_workspace "$repo" "$scratch/clean"
-    run_build clean-incremental-disabled "$scratch/clean" "$results/target-clean" 0 0 "$results/cache-clean" 0 0
-
-    copy_workspace "$repo" "$scratch/local-incremental"
-    run_build local-incremental-seed "$scratch/local-incremental" "$results/target-local" 1 0 "$results/cache-local" 0 0
-    small_edit "$scratch/local-incremental"
-    run_build local-incremental-small-edit "$scratch/local-incremental" "$results/target-local" 1 0 "$results/cache-local" 0 1
-
-    copy_workspace "$repo" "$scratch/exact"
-    run_build exact-cache-seed "$scratch/exact" "$results/target-exact" 0 1 "$results/cache-exact" 0 0
-    run_build exact-cache-hit "$scratch/exact" "$results/target-exact" 0 1 "$results/cache-exact" 0 0
-    awk -F '\t' '$1 == "exact-cache-hit" && $15 > 0 { found=1 } END { exit !found }' "$summary" || {
-        echo "sccache did not report an exact cache hit in the exact-cache case" >&2
-        exit 1
-    }
+printf 'sccache version: ' | tee -a "$results/toolchain.txt"
+"$sccache_bin" --version | tee -a "$results/toolchain.txt"
+printf 'source revision: ' | tee -a "$results/toolchain.txt"
+git -C "$repo" rev-parse HEAD | tee -a "$results/toolchain.txt"
+printf 'source worktree changes: ' | tee -a "$results/toolchain.txt"
+if [[ -z $(git -C "$repo" status --porcelain) ]]; then
+    echo clean | tee -a "$results/toolchain.txt"
+else
+    echo present-see-source-status.txt | tee -a "$results/toolchain.txt"
+    git -C "$repo" status --short > "$results/source-status.txt"
 fi
 
 docker run --rm -d --network host --name "$redis" redis:7-alpine \
@@ -185,36 +186,139 @@ for _ in $(seq 1 30); do
 done
 docker exec "$redis" redis-cli -p "$port" ping | grep -q PONG
 
-copy_workspace "$repo" "$scratch/remote-a"
-copy_workspace "$scratch/remote-a" "$scratch/remote-small"
-small_edit "$scratch/remote-small"
-copy_workspace "$scratch/remote-small" "$scratch/remote-moderate"
-moderate_edit "$scratch/remote-moderate"
-remote_target="$results/target-remote-a"
-remote_small_target="$results/target-remote-small"
-remote_moderate_target="$results/target-remote-moderate"
-[[ "$scratch/remote-a" != "$scratch/remote-small" ]]
-[[ "$scratch/remote-small" != "$scratch/remote-moderate" ]]
-[[ "$remote_target" != "$remote_small_target" && "$remote_small_target" != "$remote_moderate_target" ]]
-run_build remote-incremental-miss "$scratch/remote-a" "$remote_target" 1 1 "$results/cache-remote-a" 1 0
-run_build remote-incremental-small-edit "$scratch/remote-small" "$remote_small_target" 1 1 "$results/cache-remote-small" 1 0
-run_build remote-incremental-moderate-edit "$scratch/remote-moderate" "$remote_moderate_target" 1 1 "$results/cache-remote-moderate" 1 0
+for round in $(seq 1 "$repeats"); do
+    round_tag=$(printf 'r%02d' "$round")
+    round_root="$scratch/$round_tag"
+    mkdir -p "$round_root"
+    # Reset remote state between rounds while keeping every compiler input
+    # identical across samples.
+    docker exec "$redis" redis-cli -p "$port" FLUSHDB >/dev/null
 
-awk -F '\t' '$1 == "remote-incremental-miss" && $4 == 0 { seed=1 } END { exit !seed }' "$summary" || {
-    echo "fresh remote seed unexpectedly restored a predecessor" >&2
-    exit 1
-}
-for label in remote-incremental-small-edit remote-incremental-moderate-edit; do
-    awk -F '\t' -v label="$label" \
-        '$1 == label && $4 > 0 && $5 > 0 && $15 > 0 { found=1 } END { exit !found }' "$summary" || {
-        echo "$label did not restore rustc work products and exact-cache dependencies into an empty target" >&2
+    if [[ "${BENCH_REMOTE_ONLY:-0}" != 1 ]]; then
+        if [[ "$comparison_only" != 1 ]]; then
+            copy_workspace "$repo" "$round_root/clean"
+            run_build "$round_tag-clean-incremental-disabled" "$round_root/clean" \
+                "$results/target-$round_tag-clean" 0 0 "$results/cache-$round_tag-clean" 0 0
+        fi
+
+        copy_workspace "$repo" "$round_root/local"
+        local_target="$results/target-$round_tag-local"
+        run_build "$round_tag-local-incremental-seed" "$round_root/local" \
+            "$local_target" 1 0 "$results/cache-$round_tag-local" 0 0
+        small_edit "$round_root/local"
+        run_build "$round_tag-local-incremental-small-edit" "$round_root/local" \
+            "$local_target" 1 0 "$results/cache-$round_tag-local" 0 1
+        moderate_edit "$round_root/local"
+        run_build "$round_tag-local-incremental-moderate-edit" "$round_root/local" \
+            "$local_target" 1 0 "$results/cache-$round_tag-local" 0 1
+
+        if [[ "$comparison_only" != 1 ]]; then
+            copy_workspace "$repo" "$round_root/exact"
+            exact_target="$results/target-$round_tag-exact"
+            exact_cache="$results/cache-$round_tag-exact"
+            run_build "$round_tag-exact-cache-seed" "$round_root/exact" \
+                "$exact_target" 0 1 "$exact_cache" 0 0
+            run_build "$round_tag-exact-cache-hit" "$round_root/exact" \
+                "$exact_target" 0 1 "$exact_cache" 0 0
+            awk -F '\t' -v label="$round_tag-exact-cache-hit" \
+                '$1 == label && $15 > 0 { found=1 } END { exit !found }' "$summary" || {
+                echo "sccache did not report an exact cache hit in $round_tag" >&2
+                exit 1
+            }
+        fi
+    fi
+
+    copy_workspace "$repo" "$round_root/remote-a"
+    copy_workspace "$round_root/remote-a" "$round_root/remote-small"
+    small_edit "$round_root/remote-small"
+    copy_workspace "$round_root/remote-small" "$round_root/remote-moderate"
+    moderate_edit "$round_root/remote-moderate"
+    remote_target="$results/target-$round_tag-remote-a"
+    remote_small_target="$results/target-$round_tag-remote-small"
+    remote_moderate_target="$results/target-$round_tag-remote-moderate"
+    [[ "$round_root/remote-a" != "$round_root/remote-small" ]]
+    [[ "$round_root/remote-small" != "$round_root/remote-moderate" ]]
+    [[ "$remote_target" != "$remote_small_target" && "$remote_small_target" != "$remote_moderate_target" ]]
+    run_build "$round_tag-remote-incremental-miss" "$round_root/remote-a" \
+        "$remote_target" 1 1 "$results/cache-$round_tag-remote-a" 1 0
+    run_build "$round_tag-remote-incremental-small-edit" "$round_root/remote-small" \
+        "$remote_small_target" 1 1 "$results/cache-$round_tag-remote-small" 1 0
+    run_build "$round_tag-remote-incremental-moderate-edit" "$round_root/remote-moderate" \
+        "$remote_moderate_target" 1 1 "$results/cache-$round_tag-remote-moderate" 1 0
+
+    awk -F '\t' -v label="$round_tag-remote-incremental-miss" \
+        '$1 == label && $4 == 0 { seed=1 } END { exit !seed }' "$summary" || {
+        echo "$round_tag remote seed unexpectedly restored a predecessor" >&2
         exit 1
     }
+    for edit_case in remote-incremental-small-edit remote-incremental-moderate-edit; do
+        label="$round_tag-$edit_case"
+        awk -F '\t' -v label="$label" \
+            '$1 == label && $4 > 0 && $5 > 0 && $15 > 0 { found=1 } END { exit !found }' "$summary" || {
+            echo "$label did not restore rustc work products and exact-cache dependencies into an empty target" >&2
+            exit 1
+        }
+    done
+    rm -rf "$results/target-$round_tag-"* "$results/cache-$round_tag-"*
 done
 
 echo
 echo "summary: $summary"
-echo "logs and external targets: $results"
+echo "logs and measurements: $results"
+echo "successful-round target and cache directories were removed after metrics were recorded."
 echo "Redis network byte deltas include RESP/cache metadata and the measurement probes."
 echo "Snapshot record deltas are Redis STRLEN payload bytes; archive sizes are raw tar bytes."
 cat "$summary"
+python3 - "$summary" "$results/repeated-summary.tsv" <<'PY'
+import csv
+import statistics
+import sys
+
+summary_path, output_path = sys.argv[1:]
+with open(summary_path, newline="") as stream:
+    rows = list(csv.DictReader(stream, delimiter="\t"))
+
+cases = (
+    "local-incremental-small-edit",
+    "local-incremental-moderate-edit",
+    "remote-incremental-small-edit",
+    "remote-incremental-moderate-edit",
+)
+samples = {}
+for case in cases:
+    selected = [row for row in rows if row["case"].endswith(case)]
+    if selected:
+        samples[case] = {
+            "wall": [float(row["wall_s"]) for row in selected],
+            "rustc": [float(row["rustc_compile_s"]) for row in selected],
+        }
+
+with open(output_path, "w", newline="") as stream:
+    writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+    writer.writerow(("case", "samples", "wall_median_s", "wall_min_s", "wall_max_s", "rustc_compile_median_s", "remote_vs_local_wall_ratio_median"))
+    for case, values in samples.items():
+        paired = case.startswith("remote-")
+        local_case = case.replace("remote-", "local-", 1)
+        ratios = []
+        if paired and local_case in samples:
+            local_by_round = {}
+            remote_by_round = {}
+            for row in rows:
+                if row["case"].endswith(local_case):
+                    local_by_round[row["case"].split("-", 1)[0]] = float(row["wall_s"])
+                if row["case"].endswith(case):
+                    remote_by_round[row["case"].split("-", 1)[0]] = float(row["wall_s"])
+            ratios = [remote_by_round[tag] / local_by_round[tag] for tag in local_by_round.keys() & remote_by_round.keys()]
+        wall = values["wall"]
+        writer.writerow((
+            case,
+            len(wall),
+            f"{statistics.median(wall):.3f}",
+            f"{min(wall):.3f}",
+            f"{max(wall):.3f}",
+            f"{statistics.median(values['rustc']):.3f}",
+            f"{statistics.median(ratios):.3f}" if ratios else "",
+        ))
+print(f"repeated summary: {output_path}")
+PY
+cat "$results/repeated-summary.tsv"
