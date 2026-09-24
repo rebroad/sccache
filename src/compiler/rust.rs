@@ -1608,7 +1608,7 @@ where
         }
         let incremental_cache_key = self.parsed_args.incremental.as_ref().map(|_| {
             let mut snapshot = Digest::new();
-            snapshot.update(b"sccache-rust-incremental-snapshot-v1");
+            snapshot.update(b"sccache-rust-incremental-snapshot-v3");
             snapshot.update(CACHE_VERSION);
             self.host.hash(&mut HashToDigest {
                 digest: &mut snapshot,
@@ -1648,15 +1648,12 @@ where
             {
                 snapshot.update(digest.as_bytes());
             }
-            for (var, val) in &env_deps {
-                var.hash(&mut HashToDigest {
-                    digest: &mut snapshot,
-                });
-                snapshot.update(b"=");
-                val.hash(&mut HashToDigest {
-                    digest: &mut snapshot,
-                });
-            }
+            // Dep-info environment dependencies come from rustc's tracked
+            // env!()/option_env!() reads. Keep them in the exact-output key
+            // above, but let rustc validate and invalidate affected queries
+            // after restoring a predecessor. Hashing their values here
+            // would prevent reuse whenever Cargo changes a physical value
+            // such as OUT_DIR or a build-script export derived from it.
             for (var, val) in &env_vars {
                 if var.starts_with("CARGO_")
                     && var != "CARGO_MAKEFLAGS"
@@ -1832,6 +1829,7 @@ where
                         .clone()
                         .expect("incremental key without directory"),
                     cache_key: format!("rust-incr-{cache_key}"),
+                    crate_name: self.parsed_args.crate_name.clone(),
                 }),
                 crate_name: self.parsed_args.crate_name.clone(),
                 crate_types: self.parsed_args.crate_types.clone(),

@@ -53,6 +53,12 @@ for i in $(seq 0 127); do
     printf 'pub fn f%s() -> u32 { %s }\n' "$i" "$i" >> "$root/checkout-a/lib.rs"
 done
 printf 'pub fn source_path() -> &\x27static str { file!() }\n' >> "$root/checkout-a/lib.rs"
+cat >> "$root/checkout-a/lib.rs" <<'RS'
+#[cfg(feature = "snapshot_feature")]
+pub fn feature_value() -> u32 { 1 }
+#[cfg(not(feature = "snapshot_feature"))]
+pub fn feature_value() -> u32 { 0 }
+RS
 cp "$root/checkout-a/lib.rs" "$root/checkout-b/lib.rs"
 compile_args=("$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021
     --emit=metadata,link -Z incremental-info -C opt-level=0

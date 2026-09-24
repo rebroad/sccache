@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 const SNAPSHOT_ENTRY: &str = "snapshot.tar";
 const INDEX_ENTRY: &str = "candidates.json";
 const MAX_CANDIDATES: usize = 8;
+const SNAPSHOT_FORMAT: &str = "rust-incremental-v3";
 
 #[derive(Serialize, Deserialize)]
 struct CandidateIndex {
@@ -16,6 +17,7 @@ struct CandidateIndex {
 pub(crate) async fn restore(
     storage: &dyn Storage,
     namespace: &str,
+    crate_name: &str,
     directory: &Path,
 ) -> Result<bool> {
     let Cache::Hit(mut cache) = storage.get(&index_key(namespace)).await? else {
@@ -38,10 +40,10 @@ pub(crate) async fn restore(
             continue;
         }
         std::fs::create_dir_all(directory).context("creating Rust incremental directory")?;
-        match unpack_snapshot(&bytes, directory) {
+        match unpack_snapshot(&bytes, crate_name, directory) {
             Ok(()) => return Ok(true),
             Err(error) => {
-                let _ = std::fs::remove_dir_all(directory);
+                let _ = remove_crate_state(directory, crate_name);
                 return Err(error);
             }
         }
@@ -52,9 +54,10 @@ pub(crate) async fn restore(
 pub(crate) async fn publish(
     storage: &dyn Storage,
     namespace: &str,
+    crate_name: &str,
     directory: &Path,
 ) -> Result<()> {
-    let archive = create_snapshot(directory)?;
+    let archive = create_snapshot(crate_name, directory)?;
     let object_id = blake3::hash(&archive).to_hex().to_string();
     let mut entry = CacheWrite::new();
     entry.put_object(SNAPSHOT_ENTRY, &mut Cursor::new(archive), None)?;
@@ -89,39 +92,57 @@ pub(crate) async fn publish(
 }
 
 fn index_key(namespace: &str) -> String {
-    format!("rust-incremental-v2/{namespace}/index")
+    format!("{SNAPSHOT_FORMAT}/{namespace}/index")
 }
 fn object_key(namespace: &str, id: &str) -> String {
-    format!("rust-incremental-v2/{namespace}/objects/{id}")
+    format!("{SNAPSHOT_FORMAT}/{namespace}/objects/{id}")
 }
 
-fn create_snapshot(directory: &Path) -> Result<Vec<u8>> {
+fn crate_state_path(path: &Path, crate_name: &str) -> bool {
+    path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .starts_with(&format!("{crate_name}-"))
+    })
+}
+
+fn create_snapshot(crate_name: &str, directory: &Path) -> Result<Vec<u8>> {
     let mut archive = tar::Builder::new(Vec::new());
-    for item in walkdir::WalkDir::new(directory).follow_links(false) {
-        let item = item?;
-        let path = item.path();
-        if path == directory {
+    let mut found_state = false;
+    for entry in std::fs::read_dir(directory).context("reading Rust incremental directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        if !crate_state_path(&path, crate_name) {
             continue;
         }
-        let relative = path
-            .strip_prefix(directory)
-            .context("incremental file escaped its root")?;
-        if item.file_type().is_dir() {
-            archive.append_dir(relative, path)?;
-        } else if item.file_type().is_file() {
-            archive.append_path_with_name(path, relative)?;
-        } else {
-            return Err(anyhow!(
-                "unsupported file in incremental snapshot: {relative:?}"
-            ));
+        found_state = true;
+        for item in walkdir::WalkDir::new(&path).follow_links(false) {
+            let item = item?;
+            let item_path = item.path();
+            let relative = item_path
+                .strip_prefix(directory)
+                .context("incremental file escaped its root")?;
+            if item.file_type().is_dir() {
+                archive.append_dir(relative, item_path)?;
+            } else if item.file_type().is_file() {
+                archive.append_path_with_name(item_path, relative)?;
+            } else {
+                return Err(anyhow!(
+                    "unsupported file in incremental snapshot: {relative:?}"
+                ));
+            }
         }
+    }
+    if !found_state {
+        return Err(anyhow!(
+            "rustc produced no incremental state for {crate_name}"
+        ));
     }
     archive
         .into_inner()
         .context("finishing Rust incremental snapshot")
 }
 
-fn unpack_snapshot(bytes: &[u8], directory: &Path) -> Result<()> {
+fn unpack_snapshot(bytes: &[u8], crate_name: &str, directory: &Path) -> Result<()> {
     for item in tar::Archive::new(Cursor::new(bytes)).entries()? {
         let mut item = item?;
         let relative = item.path()?.into_owned();
@@ -129,12 +150,19 @@ fn unpack_snapshot(bytes: &[u8], directory: &Path) -> Result<()> {
             || relative
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
+            || !relative.components().next().is_some_and(|component| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .starts_with(&format!("{crate_name}-"))
+            })
             || !(item.header().entry_type().is_file() || item.header().entry_type().is_dir())
         {
             return Err(anyhow!(
                 "unsafe entry in Rust incremental snapshot: {relative:?}"
             ));
         }
+        ensure_no_symlink_ancestors(directory, &relative)?;
         let destination = directory.join(PathBuf::from(relative));
         if item.header().entry_type().is_dir() {
             std::fs::create_dir_all(&destination)?;
@@ -144,6 +172,48 @@ fn unpack_snapshot(bytes: &[u8], directory: &Path) -> Result<()> {
                 .ok_or_else(|| anyhow!("snapshot file has no parent"))?;
             std::fs::create_dir_all(parent)?;
             item.unpack(&destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_ancestors(directory: &Path, relative: &Path) -> Result<()> {
+    let mut path = directory.to_owned();
+    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(anyhow!("unsafe Rust incremental restore root: {path:?}"));
+        }
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        path.push(component.as_os_str());
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink()
+                    || (index + 1 < components.len() && !metadata.is_dir())
+                {
+                    return Err(anyhow!("unsafe Rust incremental restore path: {path:?}"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn remove_crate_state(directory: &Path, crate_name: &str) -> Result<()> {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if crate_state_path(&path, crate_name) {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
         }
     }
     Ok(())
@@ -160,12 +230,22 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Default)]
-    struct MemoryStorage(Mutex<HashMap<String, Vec<u8>>>);
+    struct MemoryStorage(
+        Mutex<HashMap<String, Vec<u8>>>,
+        Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>>,
+    );
 
     #[async_trait]
     impl Storage for MemoryStorage {
         async fn get(&self, key: &str) -> Result<Cache> {
-            match self.0.lock().unwrap().get(key).cloned() {
+            let value = self.0.lock().unwrap().get(key).cloned();
+            let barrier = self.1.lock().unwrap().clone();
+            if key == index_key("namespace")
+                && let Some(barrier) = barrier
+            {
+                barrier.wait().await;
+            }
+            match value {
                 Some(bytes) => Ok(Cache::Hit(CacheRead::from(Cursor::new(bytes))?)),
                 None => Ok(Cache::Miss),
             }
@@ -196,16 +276,32 @@ mod tests {
     #[test]
     fn snapshot_round_trip_preserves_incremental_files() {
         let source = tempfile::tempdir().unwrap();
-        std::fs::create_dir(source.path().join("session")).unwrap();
-        std::fs::write(source.path().join("session/dep-graph.bin"), b"state").unwrap();
+        std::fs::create_dir_all(source.path().join("probe-hash/session")).unwrap();
+        std::fs::write(
+            source.path().join("probe-hash/session/dep-graph.bin"),
+            b"state",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.path().join("other-hash")).unwrap();
+        std::fs::write(source.path().join("other-hash/untouched"), b"other crate").unwrap();
 
-        let archive = create_snapshot(source.path()).unwrap();
+        let archive = create_snapshot("probe", source.path()).unwrap();
         let restored = tempfile::tempdir().unwrap();
-        unpack_snapshot(&archive, restored.path()).unwrap();
+        std::fs::create_dir_all(restored.path().join("other-hash")).unwrap();
+        std::fs::write(
+            restored.path().join("other-hash/untouched"),
+            b"local sibling",
+        )
+        .unwrap();
+        unpack_snapshot(&archive, "probe", restored.path()).unwrap();
 
         assert_eq!(
-            std::fs::read(restored.path().join("session/dep-graph.bin")).unwrap(),
+            std::fs::read(restored.path().join("probe-hash/session/dep-graph.bin")).unwrap(),
             b"state"
+        );
+        assert_eq!(
+            std::fs::read(restored.path().join("other-hash/untouched")).unwrap(),
+            b"local sibling"
         );
     }
 
@@ -226,17 +322,39 @@ mod tests {
         archive[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
         let restored = tempfile::tempdir().unwrap();
 
-        assert!(unpack_snapshot(&archive, restored.path()).is_err());
+        assert!(unpack_snapshot(&archive, "probe", restored.path()).is_err());
         assert!(!restored.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_preexisting_symlink_escape() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("probe-hash/session")).unwrap();
+        std::fs::write(source.path().join("probe-hash/session/state"), b"payload").unwrap();
+        let archive = create_snapshot("probe", source.path()).unwrap();
+
+        let restored = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), restored.path().join("probe-hash")).unwrap();
+
+        assert!(unpack_snapshot(&archive, "probe", restored.path()).is_err());
+        assert!(!outside.path().join("session/state").exists());
     }
 
     #[tokio::test]
     async fn immutable_publication_restores_and_skips_evicted_or_corrupt_objects() {
         let storage = MemoryStorage::default();
         let source = tempfile::tempdir().unwrap();
-        std::fs::create_dir(source.path().join("session")).unwrap();
-        std::fs::write(source.path().join("session/dep-graph.bin"), b"state").unwrap();
-        publish(&storage, "namespace", source.path()).await.unwrap();
+        std::fs::create_dir_all(source.path().join("probe-hash/session")).unwrap();
+        std::fs::write(
+            source.path().join("probe-hash/session/dep-graph.bin"),
+            b"state",
+        )
+        .unwrap();
+        publish(&storage, "namespace", "probe", source.path())
+            .await
+            .unwrap();
 
         let (object_key, object_bytes) = {
             let entries = storage.0.lock().unwrap();
@@ -248,12 +366,12 @@ mod tests {
         };
         let restored = tempfile::tempdir().unwrap();
         assert!(
-            restore(&storage, "namespace", restored.path())
+            restore(&storage, "namespace", "probe", restored.path())
                 .await
                 .unwrap()
         );
         assert_eq!(
-            std::fs::read(restored.path().join("session/dep-graph.bin")).unwrap(),
+            std::fs::read(restored.path().join("probe-hash/session/dep-graph.bin")).unwrap(),
             b"state"
         );
 
@@ -261,7 +379,7 @@ mod tests {
         storage.0.lock().unwrap().remove(&object_key);
         let evicted = tempfile::tempdir().unwrap();
         assert!(
-            !restore(&storage, "namespace", evicted.path())
+            !restore(&storage, "namespace", "probe", evicted.path())
                 .await
                 .unwrap()
         );
@@ -283,7 +401,7 @@ mod tests {
             .insert(object_key, corrupted.finish().unwrap());
         let rejected = tempfile::tempdir().unwrap();
         assert!(
-            !restore(&storage, "namespace", rejected.path())
+            !restore(&storage, "namespace", "probe", rejected.path())
                 .await
                 .unwrap()
         );
@@ -291,11 +409,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_index_race_keeps_both_immutable_objects_and_a_usable_candidate() {
+        let storage = std::sync::Arc::new(MemoryStorage::default());
+        *storage.1.lock().unwrap() = Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for (directory, value) in [
+            (first.path(), &b"first"[..]),
+            (second.path(), &b"second"[..]),
+        ] {
+            let crate_directory = directory.join("probe-hash/session");
+            std::fs::create_dir_all(&crate_directory).unwrap();
+            std::fs::write(crate_directory.join("work-product.o"), value).unwrap();
+        }
+
+        let (first_result, second_result) = tokio::join!(
+            publish(storage.as_ref(), "namespace", "probe", first.path()),
+            publish(storage.as_ref(), "namespace", "probe", second.path()),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        *storage.1.lock().unwrap() = None;
+
+        let entries = storage.0.lock().unwrap();
+        let object_count = entries
+            .keys()
+            .filter(|key| key.contains("/objects/"))
+            .count();
+        let index_bytes = entries.get(&index_key("namespace")).unwrap();
+        let mut cache = CacheRead::from(Cursor::new(index_bytes.clone())).unwrap();
+        let mut index = Vec::new();
+        cache.get_object(INDEX_ENTRY, &mut index).unwrap();
+        let candidates: CandidateIndex = serde_json::from_slice(&index).unwrap();
+        drop(entries);
+
+        assert_eq!(object_count, 2);
+        assert_eq!(candidates.candidates.len(), 1);
+        let restored = tempfile::tempdir().unwrap();
+        assert!(
+            restore(storage.as_ref(), "namespace", "probe", restored.path())
+                .await
+                .unwrap()
+        );
+        let restored_value =
+            std::fs::read(restored.path().join("probe-hash/session/work-product.o")).unwrap();
+        assert!(restored_value == b"first" || restored_value == b"second");
+    }
+
+    #[tokio::test]
     async fn truncated_snapshot_with_valid_object_id_is_rejected_cleanly() {
         let storage = MemoryStorage::default();
         let source = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("state"), vec![b'x'; 4096]).unwrap();
-        let mut archive = create_snapshot(source.path()).unwrap();
+        std::fs::create_dir(source.path().join("probe-hash")).unwrap();
+        std::fs::write(source.path().join("probe-hash/state"), vec![b'x'; 4096]).unwrap();
+        let mut archive = create_snapshot("probe", source.path()).unwrap();
         archive.truncate(600);
         let object_id = blake3::hash(&archive).to_hex().to_string();
 
@@ -324,10 +491,10 @@ mod tests {
 
         let private = tempfile::tempdir().unwrap();
         assert!(
-            restore(&storage, "namespace", private.path())
+            restore(&storage, "namespace", "probe", private.path())
                 .await
                 .is_err()
         );
-        assert!(!private.path().exists());
+        assert!(!private.path().join("probe-hash").exists());
     }
 }

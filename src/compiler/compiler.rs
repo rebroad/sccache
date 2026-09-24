@@ -746,7 +746,15 @@ where
 
                 if let Some(state) = &incremental_state {
                     let should_restore = match std::fs::read_dir(&state.directory) {
-                        Ok(entries) => entries.count() == 0,
+                        Ok(entries) => {
+                            let entries = entries.collect::<std::io::Result<Vec<_>>>()?;
+                            !entries.iter().any(|entry| {
+                                entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .starts_with(&format!("{}-", state.crate_name))
+                            })
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                         Err(error) => {
                             warn!(
@@ -760,6 +768,7 @@ where
                         match crate::compiler::rust_incremental::restore(
                             storage.as_ref(),
                             &state.cache_key,
+                            &state.crate_name,
                             &state.directory,
                         )
                         .await
@@ -837,6 +846,7 @@ where
                     match crate::compiler::rust_incremental::publish(
                         storage.as_ref(),
                         &state.cache_key,
+                        &state.crate_name,
                         &state.directory,
                     )
                     .await
@@ -1205,6 +1215,7 @@ where
 pub struct IncrementalState {
     pub directory: PathBuf,
     pub cache_key: String,
+    pub crate_name: String,
 }
 
 #[cfg(feature = "dist-client")]

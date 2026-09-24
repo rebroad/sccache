@@ -8,7 +8,7 @@
 | Remote storage transfer | PASS |
 | Cross-machine same-host-triple reuse | PASS |
 | Concurrent publishing | PASS |
-| Corruption fallback | FAIL |
+| Corruption fallback | PASS |
 | Eviction fallback | PASS |
 | Real-workspace benchmark | FAIL |
 | Demonstrated performance improvement | INCONCLUSIVE |
@@ -17,15 +17,20 @@ Same-checkout, different-checkout, and genuine-reuse PASS evidence:
 `tests/rust-incremental-sccache-poc.sh` (including its
 `SCCACHE_TEST_ABSOLUTE_INPUT=1` mode) with rustc 1.98.1 on x86_64 Linux. The
 test uses `-Z assert-incr-state=loaded` and reports hard-linked work products.
-Cargo's different-checkout PASS evidence, including `file!()` and
-`CARGO_MANIFEST_DIR`, is `tests/rust-incremental-cargo-poc.sh` with Cargo and
-rustc both pinned to 1.98.1. Cross-
+Cargo's different-checkout PASS evidence, including `file!()`, generated source,
+build-script `OUT_DIR`, and `CARGO_MANIFEST_DIR`, is
+`tests/rust-incremental-cargo-poc.sh` with Cargo and rustc both pinned to
+1.98.1. The same script changes a path dependency after the cross-checkout
+build and proves the no-restore fallback matches a clean build. Cross-
 machine same-host-triple reuse is demonstrated by
 `tests/rust-incremental-container-reuse.sh`: separate container filesystems
 share only read-only toolchain/binary mounts and Redis. Container B reports
 five hard-linked work-product files, compares output with a clean build, and
-has an empty local cache directory. Full corruption fallback remains
-outstanding. Eviction fallback passes in
+has an empty local cache directory. Corruption fallback is exercised by
+`SCCACHE_TEST_CORRUPT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh`:
+the test truncates all immutable snapshot records in its disposable Redis
+instance, asserts that rustc did not load incremental state, then compares the
+successful build with a clean output. Eviction fallback passes in
 `immutable_publication_restores_and_skips_evicted_or_corrupt_objects`
 from `cargo test --lib rust_incremental::tests`: removing a referenced object
 returns a normal miss, and corrupt bytes under its immutable id are skipped
@@ -36,18 +41,18 @@ truncated tar whose digest matches its published id is rejected and its private
 restore directory removed; the surrounding build retry remains unverified.
 Remote transfer passes with the repository's Redis backend: Redis contained
 incremental object and index keys, and the consumer's local cache stayed empty.
-Concurrent publishing passes the two-builder scenario
-in the same script: the `concurrent-a` and `concurrent-b` processes publish
-into one disk-cache namespace, then `concurrent-reader` restores and proves
-rustc loaded prior work products. That concurrent pair targets local disk;
-concurrent remote publication remains untested.
+Concurrent publishing passes in both backends. The direct script exercises two
+writers and a later reader in local disk storage. The container script passes
+the same producer through `SCCACHE_REDIS`, so those writers publish into one
+Redis namespace concurrently and the reader restores and proves rustc loaded
+prior work products.
 
 This remains an opt-in prototype. Snapshot archives use content-addressed,
 immutable object keys. A bounded eight-entry candidate index is the only
 mutable entry and is published after the complete object. Concurrent index
 updates are last-writer-wins hints: one writer may orphan an immutable object,
 but cannot alter or corrupt another writer's snapshot. Local disk and Redis
-backends have been tested; concurrent remote-cache publication has not.
+backends, including concurrent Redis writers, have been tested.
 
 ## Current sccache behavior
 
@@ -153,12 +158,12 @@ spelling and working directory) and was not evidence of an incremental-cache
 correctness defect. Absolute paths are not rewritten by sccache; rustc's path
 mapping and query validation preserve the current checkout's observable path.
 
-The Cargo test verifies that `CARGO_MANIFEST_DIR` and `file!()` match a clean
-build in checkout B after snapshot restore. Other `file!()` forms, debug
-information, `OUT_DIR`, build-script output, proc-macro output, and path
-dependencies still need dedicated tests. Rustc's incremental query validation
-must be allowed to invalidate path-sensitive queries; the remap flag is not a
-substitute for those checks.
+The Cargo test verifies that `CARGO_MANIFEST_DIR`, `OUT_DIR`, a build-script
+export derived from `OUT_DIR`, generated-source `file!()`, and source `file!()`
+match a clean build in checkout B after snapshot restore. Proc-macro output,
+debug information, and path dependencies still need dedicated tests. Rustc's
+incremental query validation must be allowed to invalidate path-sensitive
+queries; the remap flag is not a substitute for those checks.
 `-Z remap-cwd-prefix` can change the value observable by programs and users
 must account for that behavior.
 
@@ -168,15 +173,15 @@ cross-architecture portability.
 
 ## Smallest architecture supported by the evidence
 
-Approach A, whole-directory snapshotting, works as a first experiment without
-rustc changes. Keep the exact-output lookup first. On an exact miss only:
+Crate-scoped rustc incremental snapshots work without rustc changes. Keep the
+exact-output lookup first. On an exact miss only:
 
 1. Derive a conservative compatibility namespace from compiler identity and
    host triple, crate identity, target, options/profile/features, relevant
    environment and dependency identity.
 2. Look up up to eight predecessor ids in a bounded candidate index. The
-   namespace does not require Git ancestry; path-sensitive Cargo environment
-   and dependency cases remain incompletely exercised.
+   namespace does not require Git ancestry. Rustc-tracked environment
+   dependencies are left for rustc to revalidate after restore.
 3. Restore into a private incremental directory. Never run rustc against a
    remote/shared mutable directory.
 4. Let rustc load, reject, or invalidate that state normally. Archive and digest
@@ -185,9 +190,15 @@ rustc changes. Keep the exact-output lookup first. On an exact miss only:
 5. After success, publish a complete immutable snapshot object, then update the
    bounded candidate index. Readers must never use a partial upload.
 
-The index key is `rust-incremental-v2/<namespace>/index`; its cache object
+Each immutable archive contains only the rustc directory for the crate being
+compiled. This lets Cargo's build-script crate and package crates share the
+normal target incremental root without blocking one another's restore or
+overwriting sibling crate state. Extraction rejects entries outside that
+crate-specific directory and checks existing path components for symlinks.
+
+The index key is `rust-incremental-v3/<namespace>/index`; its cache object
 `candidates.json` stores at most eight BLAKE3 archive ids, most recent first.
-Snapshot objects use `rust-incremental-v2/<namespace>/objects/<id>` and contain
+Snapshot objects use `rust-incremental-v3/<namespace>/objects/<id>` and contain
 `snapshot.tar`. The archive id hashes the complete tar bytes; readers verify
 the digest before extraction. The object is written to `Storage` before its id
 is published in the index. Missing, evicted, and hash-mismatched objects are
@@ -197,12 +208,14 @@ references but cannot mutate an immutable snapshot.
 Rustc's saved option hash is a necessary final check, not a sufficient sccache
 namespace: it does not promise to encode host CPU/OS compatibility or protect
 the snapshot transport. The current namespace includes rustc version, host
-triple, crate name, compiler options, environment dependencies, dependency
-digests, and the compiler shared-library identity. `CARGO_MANIFEST_DIR` and
+triple, crate name, compiler options, tracked Cargo configuration variables,
+dependency digests, and the compiler shared-library identity. Environment
+dependencies reported by rustc dep-info remain in the exact-output key and are
+revalidated by rustc after restore. `CARGO_MANIFEST_DIR` and
 `CARGO_MANIFEST_PATH` are omitted from the predecessor namespace because they
 name the physical checkout; they remain in the exact-output key. The Cargo
-integration test demonstrates rustc's path-sensitive values still match a clean
-build after a restored compile. Target options are included.
+integration test demonstrates path-sensitive values from the checkout and
+build script match a clean build after restore. Target options are included.
 The container test proves only the same x86_64 Linux host/target triple and
 toolchain; other host/target pairs remain unsupported.
 
@@ -211,8 +224,9 @@ source contents, so a revision change necessarily misses. A separate
 compatibility namespace plus immutable snapshot ids is implemented. The generic
 Storage API has key-based get/put but no compare-and-swap or listing. The
 bounded index tolerates last-writer wins by allowing an unreferenced immutable
-object to be orphaned; readers skip missing references. Broader Cargo workspace
-coverage remains needed for build-script and path-dependency environment values.
+object to be orphaned; readers skip missing references. Build-script `OUT_DIR`
+and build-script environment output now pass the focused Cargo test; broader
+workspace and path-dependency coverage remains.
 
 Approach B (new rustc export/import API) is not justified yet. Rustc already
 does the essential validation after a private copy. A compiler-owned snapshot
@@ -247,9 +261,13 @@ tests/rust-incremental-cargo-poc.sh
 ```
 
 It creates independent A and B checkouts and target directories, edits a Rust
-function, confirms sccache restored the predecessor and rustc hard-linked prior
-work products, then compares B's `file!()` and `CARGO_MANIFEST_DIR` program
-output with a clean B Cargo build.
+module, confirms sccache restored the predecessor and rustc hard-linked prior
+work products, then compares source/generated `file!()`, `OUT_DIR`, and
+`CARGO_MANIFEST_DIR` program output with a clean B Cargo build. It then changes
+a local path dependency and confirms the changed-dependency build does not
+restore the old predecessor and matches a clean build. The dependency-change
+case is a conservative rejection; it does not demonstrate reuse across an
+unchanged dependency artifact with a changed source checkout.
 
 To combine the experimental snapshot path with a sandbox that denies local
 IPC, set both `SCCACHE_RUST_INCREMENTAL=1` and `SCCACHE_IN_PROCESS=1`. The
@@ -289,7 +307,7 @@ tests/rust-incremental-sccache-poc.sh
 ```
 
 The E2E left its `SCCACHE_DIR` empty, and `redis-cli --scan` showed the
-`rust-incremental-v2/.../objects/...` and `/index` records. Docker bridge
+`rust-incremental-v3/.../objects/...` and `/index` records. Docker bridge
 port-forwarding was unavailable on this host, so the temporary service used
 host networking. This proves storage transfer through Redis, not cross-machine
 reuse.
@@ -307,17 +325,21 @@ real-workspace benchmark. It proves state loading and work-product reuse only.
 - **Correctness:** always restore privately and trust rustc's compatibility
   checks. A failed/partial restore must degrade to an empty state, never reuse
   outputs based only on the sccache namespace.
-- **Security:** serialized compiler state is untrusted input to rustc. Existing
-  cache formats do not establish that hostile incremental state is safe. Keep
-  this feature opt-in and trusted-cache-only until the rustc parser and archive
-  extraction attack surfaces are reviewed.
-- **Concurrency/eviction:** snapshots are immutable and index updates are
-  last-writer-wins hints. Races, remote-backend consistency, and eviction
-  fallback are not yet tested. Never share a live incremental directory.
-- **Portability:** x86_64-host to aarch64-target is not equivalent to
-  aarch64-host to aarch64-target. The host triple must be a namespace key;
-  whether even same-triple machines can share state remains experimentally
-  unverified.
+- **Security:** archive traversal and pre-existing symlink escapes are covered
+  by `snapshot_rejects_parent_traversal` and
+  `snapshot_rejects_preexisting_symlink_escape`. Serialized compiler state is
+  still untrusted input to rustc, so keep the feature opt-in and use only a
+  trusted cache until the rustc parser is reviewed.
+- **Concurrency/eviction:** immutable objects and concurrent local/Redis
+  publication are exercised by `tests/rust-incremental-sccache-poc.sh` and
+  `tests/rust-incremental-container-reuse.sh`. Index updates remain
+  last-writer-wins hints; an update can orphan an immutable object. The unit
+  test `immutable_publication_restores_and_skips_evicted_or_corrupt_objects`
+  covers missing-object fallback. Never share a live incremental directory.
+- **Portability:** separate Linux containers on x86_64 with the same host and
+  target triples passed. This does not prove other kernel, OS, CPU-feature, or
+  architecture combinations. x86_64-host to aarch64-target is not equivalent
+  to aarch64-host to aarch64-target.
 - **Cost:** the prototype measures one snapshot's compressed and raw sizes.
   Consecutive-snapshot duplication, upload/download latency, and compile-time
   savings remain to be measured on a real Cargo workspace.
@@ -335,8 +357,10 @@ review.
 ## Files changed in this prototype
 
 - `GOAL.md`
+- `src/compiler/compiler.rs`
 - `src/compiler/rust.rs`
 - `src/compiler/rust_incremental.rs`
+- `tests/rust-incremental-cargo-poc.sh`
 - `tests/rust-incremental-sccache-poc.sh`
 - `tests/Dockerfile.rust-incremental`
 - `tests/rust-incremental-container-consumer.sh`
