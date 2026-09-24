@@ -16,8 +16,8 @@ use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
-    SingleCompileCommand, c::ArtifactDescriptor,
+    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, IncrementalState,
+    Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, OutputsRewriter};
@@ -152,6 +152,7 @@ pub struct ParsedArguments {
     externs: Vec<PathBuf>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
+    incremental: Option<PathBuf>,
     /// Static libraries linked to in the compile.
     staticlibs: Vec<PathBuf>,
     /// The crate name passed to --crate-name.
@@ -211,6 +212,7 @@ pub struct RustCompilation {
     outputs: HashMap<String, ArtifactDescriptor>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
+    incremental: Option<IncrementalState>,
     /// The crate name being compiled.
     crate_name: String,
     /// The crate types that will be generated
@@ -534,9 +536,12 @@ where
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
+        let incremental_enabled = env_vars
+            .iter()
+            .any(|(key, value)| key == "SCCACHE_RUST_INCREMENTAL" && value == "1");
+        match parse_arguments_with_incremental(arguments, cwd, incremental_enabled) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -1117,7 +1122,16 @@ impl Iterator for ExpandResponseFile<'_> {
     }
 }
 
+#[cfg(test)]
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with_incremental(arguments, cwd, false)
+}
+
+fn parse_arguments_with_incremental(
+    arguments: &[OsString],
+    cwd: &Path,
+    incremental_enabled: bool,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1138,6 +1152,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut profile = None;
     let mut gcno = false;
     let mut target_json = None;
+    let mut incremental = None;
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
@@ -1192,23 +1207,16 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(CrateName(value)) => crate_name = Some(value.clone()),
             Some(OutDir(value)) => output_dir = Some(value.clone()),
             Some(Extern(ArgExtern { path, .. })) => externs.push(path.clone()),
-            Some(CodeGen(ArgCodegen { opt, value })) => {
-                match (opt.as_ref(), value) {
-                    ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
-                    ("extra-filename", None) => cannot_cache!("extra-filename"),
-                    ("profile-use", Some(v)) => profile = Some(v.clone()),
-                    // Incremental compilation makes a mess of sccache's entire world
-                    // view. It produces additional compiler outputs that we don't cache,
-                    // and just letting rustc do its work in incremental mode is likely
-                    // to be faster than trying to fetch a result from cache anyway, so
-                    // don't bother caching compiles where it's enabled currently.
-                    // Longer-term we would like to figure out better integration between
-                    // sccache and rustc in the incremental scenario:
-                    // https://github.com/mozilla/sccache/issues/236
-                    ("incremental", _) => cannot_cache!("incremental"),
-                    (_, _) => (),
+            Some(CodeGen(ArgCodegen { opt, value })) => match (opt.as_ref(), value) {
+                ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
+                ("extra-filename", None) => cannot_cache!("extra-filename"),
+                ("profile-use", Some(v)) => profile = Some(v.clone()),
+                ("incremental", Some(path)) if incremental_enabled => {
+                    incremental = Some(cwd.join(path));
                 }
-            }
+                ("incremental", _) => cannot_cache!("incremental"),
+                (_, _) => (),
+            },
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
                 Some("y") | Some("yes") | Some("on") | None if opt == "profile" => {
                     gcno = true;
@@ -1278,7 +1286,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     }
     // We don't actually save the input value, but there needs to be one.
     req!(input);
-    drop(input);
+    let _ = input;
     req!(output_dir);
     req!(emit);
     req!(crate_name);
@@ -1362,6 +1370,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         crate_types,
         externs,
         crate_link_paths,
+        incremental,
         staticlibs,
         crate_name,
         dep_info: dep_info.map(|s| s.into()),
@@ -1410,7 +1419,11 @@ where
         let filtered_arguments = os_string_arguments
             .iter()
             .filter_map(|(arg, val)| {
-                if arg == "--emit" || arg == "--out-dir" {
+                let is_incremental = matches!(arg.to_str(), Some("-C" | "--codegen"))
+                    && val
+                        .as_ref()
+                        .is_some_and(|value| value.to_string_lossy().starts_with("incremental="));
+                if arg == "--emit" || arg == "--out-dir" || is_incremental {
                     None
                 } else {
                     Some((arg, val))
@@ -1544,10 +1557,10 @@ where
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         for h in source_hashes
-            .into_iter()
-            .chain(extern_hashes)
-            .chain(staticlib_hashes)
-            .chain(target_json_hash)
+            .iter()
+            .chain(&extern_hashes)
+            .chain(&staticlib_hashes)
+            .chain(&target_json_hash)
         {
             m.update(h.as_bytes());
         }
@@ -1591,21 +1604,99 @@ where
             m.update(b"=");
             val.hash(&mut HashToDigest { digest: &mut m });
         }
+        let incremental_cache_key = self.parsed_args.incremental.as_ref().map(|_| {
+            let mut snapshot = Digest::new();
+            snapshot.update(b"sccache-rust-incremental-snapshot-v1");
+            snapshot.update(CACHE_VERSION);
+            self.host.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            self.version.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            self.parsed_args.crate_name.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            for digest in &self.compiler_shlibs_digests {
+                snapshot.update(digest.as_bytes());
+            }
+            for argument in &self.parsed_args.arguments {
+                let skip = match argument.get_data() {
+                    Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental" => true,
+                    Some(Unstable(ArgUnstable { opt, .. })) if opt == "assert-incr-state" => true,
+                    _ => false,
+                };
+                if !skip {
+                    argument.to_os_string().hash(&mut HashToDigest {
+                        digest: &mut snapshot,
+                    });
+                    if let Some(value) = argument.get_data() {
+                        value.clone().into_arg_os_string().hash(&mut HashToDigest {
+                            digest: &mut snapshot,
+                        });
+                    }
+                }
+            }
+            for digest in extern_hashes
+                .iter()
+                .chain(&staticlib_hashes)
+                .chain(&target_json_hash)
+            {
+                snapshot.update(digest.as_bytes());
+            }
+            for (var, val) in &env_deps {
+                var.hash(&mut HashToDigest {
+                    digest: &mut snapshot,
+                });
+                snapshot.update(b"=");
+                val.hash(&mut HashToDigest {
+                    digest: &mut snapshot,
+                });
+            }
+            for (var, val) in &env_vars {
+                if var.starts_with("CARGO_")
+                    && var != "CARGO_MAKEFLAGS"
+                    && !var.starts_with("CARGO_REGISTRIES_")
+                    && var != "CARGO_BUILD_JOBS"
+                    && var != "CARGO_ENCODED_RUSTFLAGS"
+                {
+                    var.hash(&mut HashToDigest {
+                        digest: &mut snapshot,
+                    });
+                    snapshot.update(b"=");
+                    val.hash(&mut HashToDigest {
+                        digest: &mut snapshot,
+                    });
+                }
+            }
+            // rustc 1.93 rejects otherwise identical state from a different checkout
+            // because its saved command line embeds the compilation context.
+            cwd.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            snapshot.finish()
+        });
         // 9. The cwd of the compile. This will wind up in the rlib.
         cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
+        let output_name_arguments = os_string_arguments
             .into_iter()
+            .filter(|(arg, val)| {
+                !(matches!(arg.to_str(), Some("-C" | "--codegen"))
+                    && val
+                        .as_ref()
+                        .is_some_and(|value| value.to_string_lossy().starts_with("incremental=")))
+            })
             .flat_map(|(arg, val)| iter::once(arg).chain(val))
             .collect();
 
         let mut outputs = get_compiler_outputs(
             creator,
             &self.executable,
-            flat_os_string_arguments,
+            output_name_arguments,
             &cwd,
             &env_vars,
         )
@@ -1730,6 +1821,14 @@ where
                 inputs,
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
+                incremental: incremental_cache_key.map(|cache_key| IncrementalState {
+                    directory: self
+                        .parsed_args
+                        .incremental
+                        .clone()
+                        .expect("incremental key without directory"),
+                    cache_key: format!("rust-incr-{cache_key}"),
+                }),
                 crate_name: self.parsed_args.crate_name.clone(),
                 crate_types: self.parsed_args.crate_types.clone(),
                 dep_info,
@@ -1953,6 +2052,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             path: v.path.clone(),
             optional: v.optional,
         }))
+    }
+
+    fn incremental_state(&self) -> Option<IncrementalState> {
+        self.incremental.clone()
     }
 }
 
@@ -2998,6 +3101,25 @@ LLVM version: 15.0.2
             "incremental=/foo"
         );
         assert_eq!(r, CompilerArguments::CannotCache("incremental", None));
+        let enabled_args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "incremental=/foo",
+        ]
+        .map(OsString::from);
+        let enabled = parse_arguments_with_incremental(&enabled_args, Path::new("/"), true);
+        let CompilerArguments::Ok(enabled) = enabled else {
+            panic!("opted-in incremental arguments were rejected");
+        };
+        assert_eq!(enabled.incremental, Some(PathBuf::from("/foo")));
     }
 
     #[test]
@@ -3570,6 +3692,7 @@ proc_macro false
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
                 crate_link_paths: vec![],
+                incremental: None,
                 staticlibs: vec![f.tempdir.path().join("libbaz.a")],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {

@@ -7,7 +7,7 @@ sccache includes support for caching Rust compilation. This includes many caveat
 * Compilation from stdin is not supported, a source file must be provided.
 * Values from `env!` require Rust >= 1.46 to be tracked in caching.
 * Procedural macros that read files from the filesystem may not be cached properly.
-* `rustc`'s incremental compilation needs to be disabled. See [The Cargo Book](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental)
+* Incremental Rust compilation is unsupported by default. Experimental whole-directory snapshot support can be enabled with `SCCACHE_RUST_INCREMENTAL=1`; see [Rust incremental snapshots](RustIncrementalSnapshots.md). Use it only with a trusted cache. Incremental compilations run locally, not through distributed compilation.
 * Crates that invoke the system linker cannot be cached. Examples are `bin`, `dylib`, `cdylib`, and `proc-macro` crates.
 
 If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation with sccache by setting `RUSTC_WRAPPER=sccache` in your build environment.

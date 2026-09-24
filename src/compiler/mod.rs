@@ -29,6 +29,7 @@ mod nvhpc;
 mod preprocessor_cache;
 mod ptxas;
 mod rust;
+pub(crate) mod rust_incremental;
 mod tasking_vx;
 #[macro_use]
 mod counted_array;

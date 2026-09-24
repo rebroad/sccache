@@ -587,6 +587,11 @@ where
                 weak_toolchain_key,
             }) => (key, compilation, weak_toolchain_key),
         };
+        let incremental_state = if cache_control == CacheControl::Default {
+            compilation.incremental_state()
+        } else {
+            None
+        };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
@@ -739,9 +744,52 @@ where
                         .await;
                 }
 
+                if let Some(state) = &incremental_state {
+                    let should_restore = match std::fs::read_dir(&state.directory) {
+                        Ok(entries) => entries.count() == 0,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => {
+                            warn!(
+                                "[{}]: cannot inspect Rust incremental directory: {error}",
+                                out_pretty
+                            );
+                            false
+                        }
+                    };
+                    if should_restore {
+                        match crate::compiler::rust_incremental::restore(
+                            storage.as_ref(),
+                            &state.cache_key,
+                            &state.directory,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                debug!("[{}]: restored Rust incremental snapshot", out_pretty)
+                            }
+                            Ok(false) => {
+                                debug!("[{}]: no Rust incremental snapshot", out_pretty)
+                            }
+                            Err(error) => warn!(
+                                "[{}]: rejected Rust incremental snapshot: {error:#}",
+                                out_pretty
+                            ),
+                        }
+                    } else {
+                        debug!(
+                            "[{}]: keeping existing local Rust incremental state",
+                            out_pretty
+                        );
+                    }
+                }
+                let compile_dist_client = if incremental_state.is_some() {
+                    None
+                } else {
+                    dist_client
+                };
                 let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
                     service,
-                    dist_client,
+                    compile_dist_client,
                     creator,
                     cwd,
                     compilation,
@@ -784,6 +832,21 @@ where
                         CompileResult::NotCacheable(dist_type, duration_compilation),
                         compiler_result,
                     ));
+                }
+                if let Some(state) = &incremental_state {
+                    match crate::compiler::rust_incremental::publish(
+                        storage.as_ref(),
+                        &state.cache_key,
+                        &state.directory,
+                    )
+                    .await
+                    {
+                        Ok(()) => debug!("[{}]: published Rust incremental snapshot", out_pretty),
+                        Err(error) => warn!(
+                            "[{}]: failed to publish Rust incremental snapshot: {error:#}",
+                            out_pretty
+                        ),
+                    }
                 }
                 debug!(
                     "[{}]: Compiled in {}, storing in cache",
@@ -1132,6 +1195,16 @@ where
     /// Each item is a descriptive (and unique) name of the output paired with
     /// the path where it'll show up.
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a>;
+
+    fn incremental_state(&self) -> Option<IncrementalState> {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct IncrementalState {
+    pub directory: PathBuf,
+    pub cache_key: String,
 }
 
 #[cfg(feature = "dist-client")]

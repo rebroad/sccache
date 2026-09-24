@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{IpcStorage, storage_from_config};
+use crate::cache::readonly::ReadOnlyStorage;
+use crate::cache::{CacheMode, IpcStorage, Storage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::ColorMode;
@@ -715,6 +716,57 @@ where
     Ok(exit_code)
 }
 
+/// Run a compile against storage in this wrapper process, without a daemon or
+/// local IPC. This is intended for isolated build sandboxes with a writable
+/// cache directory but no socket permission.
+#[allow(clippy::too_many_arguments)]
+pub fn do_compile_in_process<C>(
+    jobserver: &Client,
+    runtime: &mut Runtime,
+    storage: Arc<dyn Storage>,
+    exe: &Path,
+    cmdline: Vec<OsString>,
+    cwd: &Path,
+    path: Option<OsString>,
+    env_vars: Vec<(OsString, OsString)>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<i32>
+where
+    C: CommandCreatorSync + Clone + Send + Sync + 'static,
+{
+    trace!("do_compile_in_process");
+    let exe_path = which_in(exe, path, cwd)?;
+    let (tx, _rx) = futures::channel::mpsc::channel(1);
+    let (_, info) = server::WaitUntilZero::new();
+    let service = server::SccacheService::<C>::new(
+        server::DistClientContainer::new_disabled(),
+        storage,
+        jobserver,
+        runtime.handle().clone(),
+        tx,
+        info,
+    );
+    let compile = Compile {
+        exe: exe_path.as_os_str().to_owned(),
+        cwd: cwd.as_os_str().to_owned(),
+        args: cmdline.clone(),
+        env_vars,
+    };
+    let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
+    handle_compile_result(
+        C::new(jobserver),
+        runtime,
+        compile_resp,
+        finished,
+        &exe_path,
+        cmdline,
+        cwd,
+        stdout,
+        stderr,
+    )
+}
+
 /// Run `cmd` and return the process exit status.
 pub fn run_command(cmd: Command) -> Result<i32> {
     // Config isn't required for all commands, but if it's broken then we should flag
@@ -900,10 +952,12 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
 
             let incr_env_strs = ["CARGO_BUILD_INCREMENTAL", "CARGO_INCREMENTAL"];
+            let rust_incremental_enabled =
+                env::var("SCCACHE_RUST_INCREMENTAL").is_ok_and(|value| value == "1");
             incr_env_strs
                 .iter()
                 .for_each(|incr_str| match env::var(incr_str) {
-                    Ok(incr_val) if incr_val == "1" => {
+                    Ok(incr_val) if incr_val == "1" && !rust_incremental_enabled => {
                         println!(
                             "sccache: incremental compilation is prohibited: Unset {} to continue.",
                             incr_str
@@ -914,6 +968,28 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 });
 
             let jobserver = Client::new();
+            if env::var("SCCACHE_IN_PROCESS").is_ok_and(|value| value == "1") {
+                let mut runtime = new_client_runtime()?;
+                let storage = storage_from_config(config, runtime.handle())?;
+                let cache_mode = runtime.block_on(storage.check())?;
+                let storage: Arc<dyn Storage> = match cache_mode {
+                    CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(storage)),
+                    CacheMode::ReadWrite => storage,
+                };
+                return do_compile_in_process::<ProcessCommandCreator>(
+                    &jobserver,
+                    &mut runtime,
+                    storage,
+                    exe.as_ref(),
+                    cmdline,
+                    &cwd,
+                    env::var_os("PATH"),
+                    env_vars,
+                    &mut io::stdout(),
+                    &mut io::stderr(),
+                )
+                .context("failed to execute compile in process");
+            }
             let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
             if config.client_side_mode {
                 // Under make -jN each CLI process gets only 2 worker threads;
