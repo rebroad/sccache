@@ -9,6 +9,7 @@
 | Separate-filesystem/container reuse | PASS |
 | Fresh target-root predecessor discovery | PASS |
 | Fresh-builder real-workspace reuse | PASS |
+| Cargo feature-change namespace fallback | PASS |
 | Immutable snapshot publication | PASS |
 | Bounded candidate lookup | PASS |
 | Concurrent publishing | PASS |
@@ -23,7 +24,7 @@
 | Proc-macro expansion path behavior | PASS |
 | Debug-info path remapping | PASS |
 | Real-workspace benchmark completed | PASS |
-| Demonstrated performance improvement | INCONCLUSIVE |
+| Demonstrated performance improvement | FAIL (tested workspace) |
 
 Every PASS below names its automated test or command. The container evidence is
 for separate Linux filesystems with the same host/target triple and toolchain;
@@ -35,7 +36,13 @@ for a dependency, verifies an `OUT_DIR`-sensitive dependency artifact differs
 between target roots, then asserts rustc loaded the app predecessor and
 hard-linked five work products. The restored program output matches a clean
 Builder B build. A further build changes `CARGO_TARGET_DIR` and again proves
-predecessor loading and clean-output equivalence.
+predecessor loading and clean-output equivalence. A final build enables a real
+Cargo feature: it selects a distinct predecessor namespace, does not restore
+the incompatible no-feature snapshot, and matches a clean feature-enabled
+build. Builder B has an empty target at startup; restoring dependency artifacts
+through ordinary exact sccache hits is explicitly allowed and expected. The
+test proves those hits materialize dependencies into Builder B's fresh target
+without inheriting Builder A's live target tree.
 
 The real-workspace command and data are recorded under [real-workspace
 benchmark](#real-workspace-benchmark). It uses separate source checkouts and
@@ -471,13 +478,58 @@ the shared cache dataset shown above. Each edit reused 260 hard-linked
 work-product files. The moderate edit restored a larger prior snapshot because
 the preceding small edit had itself published updated compiler state.
 
-Remote incremental results are from a later run after the baseline run; do
-not compare these as a controlled performance trial. The run confirms correct
-discovery, transfer, restore, and reuse; it does not establish a net speedup.
-Remote small/moderate builds remain slower in wall time than the 10.924-second
-local incremental edit, and the remote snapshot writes roughly 191 MB of
-compressed payload after each edit. Performance improvement is therefore
-INCONCLUSIVE and must not be claimed.
+The three-round controlled comparison below supersedes the earlier single-run
+performance interpretation.
+
+### Controlled repeated comparison
+
+The exact command was:
+
+```sh
+TMPDIR=/var/tmp \
+BENCH_REPEATS=3 \
+CARGO_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo \
+RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+BENCH_BUILD_ROOT=/mnt/kingston/builds/rebroad/src/sccache.build \
+tests/rust-incremental-workspace-benchmark.sh
+```
+
+This ran cleanly from revision `fc7c1fa3eb2cb5802f765481dc26242cfa4944a2`
+on rustc 1.98.1, x86_64 Linux, sccache 0.18.0. The three rounds used the same
+compiler inputs, benchmark order, and Redis 7 instance; Redis was flushed
+between rounds. The benchmark recorded medians and ranges in
+`/mnt/kingston/builds/rebroad/src/sccache.build/workspace-benchmark-20260924T211056Z/repeated-summary.tsv`.
+Each local run retained its target directory between seed and edits. Every
+remote edit used a different source root and an initially empty target; its
+dependencies came through Redis exact-cache hits. Builder B must not inherit
+Builder A's live target directory, but dependency artifacts may and should be
+materialized by normal exact sccache hits into B's empty target. Targets and
+per-builder caches were removed after each round to control disk use.
+
+| Edit case | Local incremental wall median [min, max] | Fresh-target Redis wall median [min, max] | Remote/local wall ratio median | Work reused |
+| --- | ---: | ---: | ---: | --- |
+| Small | 11.738 s [10.751, 12.343] | 120.750 s [117.335, 125.434] | 10.686x | 268 local; 260 remote work products per round |
+| Moderate | 13.417 s [12.704, 13.561] | 118.510 s [117.169, 126.538] | 9.223x | 268 local; 260 remote work products per round |
+
+Remote small edit medians: rustc compile elapsed 90.990 s, 364,956,160 B raw
+snapshot restored, 730,067,456 B raw snapshots published, 191,436,621 B
+compressed snapshot payload written, 322,186,674 B Redis uploaded, 284,756,583 B
+downloaded, 2,252.893 ms fetch, 237.602 ms unpack, and 732,493,715 B dataset
+after the case. The moderate edit medians were 91.355 s rustc compile elapsed,
+730,067,456 B restored, 731,663,872 B published, 191,823,882 B compressed
+payload written, 317,805,135 B uploaded, 385,450,535 B downloaded, 4,465.049 ms
+fetch, 529.443 ms unpack, and 1,050,274,803 B dataset after the case. Redis
+wire totals include exact-cache artifacts and metadata; snapshot payload counts
+only the immutable snapshot records. Each remote edit also recorded over 1,080
+exact-cache hits.
+
+The result is a performance **FAIL for this tested workspace and configuration**:
+fresh-target Redis edits took about 9.2–10.7 times longer than local
+incremental edits in all three paired rounds, despite genuine rustc reuse.
+The snapshot representation and transfer costs exceed the time saved here.
+This does not prove that every workspace or backend will regress, but the
+prototype must not claim a performance improvement based on these results.
 
 ## Risks and remaining measurements
 

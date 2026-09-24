@@ -50,6 +50,9 @@ edition = "2021"
 stable_dependency = { path = "../../shared/stable_dependency" }
 generated_dependency = { path = "../../shared/generated_dependency" }
 
+[features]
+snapshot_feature = []
+
 [profile.dev]
 incremental = true
 
@@ -60,8 +63,13 @@ TOML
 mod component;
 
 pub fn value() -> u32 {
-    component::value() + stable_dependency::value() + generated_dependency::value()
+    component::value() + stable_dependency::value() + generated_dependency::value() + feature_bonus()
 }
+
+#[cfg(feature = "snapshot_feature")]
+fn feature_bonus() -> u32 { 100 }
+#[cfg(not(feature = "snapshot_feature"))]
+fn feature_bonus() -> u32 { 0 }
 
 pub fn generated_out_dir() -> &'static str {
     generated_dependency::generated_out_dir()
@@ -236,6 +244,36 @@ namespace_c=$(sed -n 's/.*\[fresh_target_probe\]: Rust incremental predecessor n
 grep -q '^62 ' "$root/c.out"
 grep -F "$root/target-c/" "$root/c.out" >/dev/null
 grep -F "$root/target-clean-c/" "$root/clean-c.out" >/dev/null
+
+# Cargo feature configuration must not reuse the no-feature predecessor.
+if [[ -e "$root/target-d" ]]; then
+    echo "Builder D target unexpectedly exists before its build" >&2
+    exit 1
+fi
+(
+    cd "$root/b/app"
+    SCCACHE_ASSERT_INCR_STATE=not-loaded "$cargo_bin" build --features snapshot_feature \
+        --target-dir "$root/target-d" -vv > "$root/d.log" 2>&1
+)
+grep -F '[fresh_target_probe]: no Rust incremental snapshot' "$root/d.log" >/dev/null
+if grep -F '[fresh_target_probe]: restored Rust incremental snapshot' "$root/d.log" >/dev/null; then
+    echo "restored a no-feature predecessor into the feature-enabled build" >&2
+    exit 1
+fi
+namespace_d=$(sed -n 's/.*\[fresh_target_probe\]: Rust incremental predecessor namespace=\([0-9a-f]*\).*/\1/p' "$root/d.log" | tail -1)
+[[ -n "$namespace_b" && -n "$namespace_d" && "$namespace_b" != "$namespace_d" ]]
+"$root/target-d/debug/fresh_target_probe" > "$root/d.out"
+(
+    cd "$root/b/app"
+    RUSTC_WRAPPER= "$cargo_bin" build --features snapshot_feature \
+        --target-dir "$root/target-clean-d" -vv > "$root/clean-d.log" 2>&1
+)
+"$root/target-clean-d/debug/fresh_target_probe" > "$root/clean-d.out"
+[[ "$(cut -d ' ' -f 1 "$root/d.out")" == "$(cut -d ' ' -f 1 "$root/clean-d.out")" ]]
+grep -q '^162 ' "$root/d.out"
+grep -F "$root/target-d/" "$root/d.out" >/dev/null
+grep -F "$root/target-clean-d/" "$root/clean-d.out" >/dev/null
+printf 'Cargo feature change selected a distinct namespace and matched a clean output: %s\n' "$namespace_d"
 
 printf 'Builder B exact dependency cache hit: '
 grep -F '[stable_dependency]: Cache hit' "$root/b.log" | head -1

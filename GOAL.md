@@ -33,9 +33,19 @@ and `CARGO_TARGET_DIR` changes.
 This resolves the fresh-builder functional milestone on rustc 1.98.1,
 x86_64 Linux with Redis shared storage. It does not establish a performance
 improvement: the remote edits are much slower than a local incremental edit.
+Three paired real-workspace rounds ran on 2026-09-24. Median local incremental
+edits took 11.738 seconds (small) and 13.417 seconds (moderate); fresh-target
+Redis edits took 120.750 and 118.510 seconds, with 260 restored work products
+per edit. This is a performance FAIL for the tested workspace/configuration
+(9.2–10.7x slower), despite functional reuse. Do not claim a performance gain.
+
 Current additional test results on 2026-09-24:
 
-- Changed Cargo feature/cfg: safe no-restore fallback, clean output matched.
+- Changed Cargo feature through a real Cargo invocation: safe no-restore
+  fallback, distinct predecessor namespace, clean feature-enabled output
+  matched. The fresh-target test also proves Builder B starts without
+  Builder A's target tree and reconstructs dependencies through ordinary exact
+  sccache hits; this is allowed and expected by the goal.
 - Changed `RUSTFLAGS`: safe no-restore fallback, clean output matched.
 - Changed target triple to i686 on the same x86_64 host: no restore; clean
   target output verified.
@@ -252,12 +262,10 @@ Do not preserve Builder A's target/deps merely to make this pass.
 PERFORMANCE
 ============================================================
 
-Latest real-workspace snapshot measurements are approximately:
-
-    362 MB raw
-    95 MB compressed/Redis payload
-
-should be recorded as a concern.
+The repeated real-workspace benchmark found median snapshot measurements of
+approximately 365 MB raw / 95.6 MB compressed on the initial remote seed miss,
+and about 730 MB raw / 191 MB compressed for each edited snapshot publication.
+This transfer and storage cost is a concern alongside the measured slowdown.
 
 Snapshot chunks were introduced because the Redis client response timeout
 prevented retrieval of large single records. The current chunked layout uses
@@ -274,7 +282,7 @@ is efficient. Continue to measure separately:
      the compiler work?
 
 A functional PASS with a performance FAIL or INCONCLUSIVE result is a valid
-research outcome.
+research outcome; report the measured FAIL for this workspace clearly.
 
 ============================================================
 REMAINING DISTRIBUTED-CACHE WORK
