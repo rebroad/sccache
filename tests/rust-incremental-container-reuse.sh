@@ -68,7 +68,7 @@ fi
 if [[ ${SCCACHE_TEST_CORRUPT_SNAPSHOTS:-0} == 1 || ${SCCACHE_TEST_EVICT_SNAPSHOTS:-0} == 1 ]]; then
     consumer_restore=0
     mapfile -t snapshot_keys < <(
-        docker exec "$redis" redis-cli -p "$port" --scan | grep '/rust-incremental-v3/.*/objects/'
+        docker exec "$redis" redis-cli -p "$port" --scan | grep '/rust-incremental-v4/.*/objects/'
     )
     if [[ ${#snapshot_keys[@]} -eq 0 ]]; then
         echo "Redis contains no Rust incremental snapshot objects to corrupt." >&2

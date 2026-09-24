@@ -33,8 +33,22 @@ and `CARGO_TARGET_DIR` changes.
 This resolves the fresh-builder functional milestone on rustc 1.98.1,
 x86_64 Linux with Redis shared storage. It does not establish a performance
 improvement: the remote edits are much slower than a local incremental edit.
-Continue the remaining matrix, failure-mode, security, and reproducibility
-work; do not rewrite this resolved milestone as a remaining blocker.
+Current additional test results on 2026-09-24:
+
+- Changed Cargo feature/cfg: safe no-restore fallback, clean output matched.
+- Changed `RUSTFLAGS`: safe no-restore fallback, clean output matched.
+- Changed target triple to i686 on the same x86_64 host: no restore; clean
+  target output verified.
+- rustc 1.98.1 producer to rustc 1.93.0 consumer: no restore; clean output
+  matched.
+- Corrupted and evicted Redis v4 object records: fallback output matched.
+- Changed path dependency: no restore; clean output matched.
+- Concurrent Redis publication/read: reader restored and reused prior work.
+- Interrupted manifest and index writes: no partial candidate became visible.
+- Candidate index: newest eight retained.
+
+Continue remaining security, portability, and reproducibility work; do not
+rewrite the resolved fresh-builder milestone as a blocker.
 
 ============================================================
 REGRESSION REQUIREMENT — FRESH-BUILDER PREDECESSOR DISCOVERY

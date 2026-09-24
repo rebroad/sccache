@@ -346,6 +346,7 @@ mod tests {
     struct MemoryStorage(
         Mutex<HashMap<String, Vec<u8>>>,
         Mutex<Option<std::sync::Arc<tokio::sync::Barrier>>>,
+        Mutex<Option<String>>,
     );
 
     #[async_trait]
@@ -365,6 +366,9 @@ mod tests {
         }
 
         async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
+            if self.2.lock().unwrap().as_deref() == Some(key) {
+                return Err(anyhow!("injected storage write failure for {key}"));
+            }
             self.0
                 .lock()
                 .unwrap()
@@ -535,6 +539,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_snapshot_upload_is_never_published_as_a_candidate() {
+        let storage = MemoryStorage::default();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("probe-hash/session")).unwrap();
+        std::fs::write(
+            source.path().join("probe-hash/session/dep-graph.bin"),
+            b"state",
+        )
+        .unwrap();
+        let archive = create_snapshot("probe", source.path()).unwrap();
+        let object_id = blake3::hash(&archive).to_hex().to_string();
+        *storage.2.lock().unwrap() = Some(manifest_key("namespace", &object_id));
+
+        assert!(
+            publish(&storage, "namespace", "probe", source.path())
+                .await
+                .is_err()
+        );
+        let entries = storage.0.lock().unwrap();
+        assert!(entries.keys().any(|key| {
+            key.starts_with(&format!("{}/chunks/", object_key("namespace", &object_id)))
+        }));
+        assert!(!entries.contains_key(&manifest_key("namespace", &object_id)));
+        assert!(!entries.contains_key(&index_key("namespace")));
+        drop(entries);
+
+        let restored = tempfile::tempdir().unwrap();
+        assert!(
+            !restore(&storage, "namespace", "probe", restored.path())
+                .await
+                .unwrap()
+        );
+        assert!(std::fs::read_dir(restored.path()).unwrap().next().is_none());
+
+        // A complete immutable object whose index publication fails is also
+        // unreachable to readers; it is merely an orphan that can be retried.
+        *storage.2.lock().unwrap() = Some(index_key("namespace"));
+        assert!(
+            publish(&storage, "namespace", "probe", source.path())
+                .await
+                .is_err()
+        );
+        assert!(
+            storage
+                .0
+                .lock()
+                .unwrap()
+                .contains_key(&manifest_key("namespace", &object_id))
+        );
+        assert!(
+            !storage
+                .0
+                .lock()
+                .unwrap()
+                .contains_key(&index_key("namespace"))
+        );
+        let after_index_failure = tempfile::tempdir().unwrap();
+        assert!(
+            !restore(&storage, "namespace", "probe", after_index_failure.path())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_index_race_keeps_both_immutable_objects_and_a_usable_candidate() {
         let storage = std::sync::Arc::new(MemoryStorage::default());
         *storage.1.lock().unwrap() = Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
@@ -580,6 +649,43 @@ mod tests {
         let restored_value =
             std::fs::read(restored.path().join("probe-hash/session/work-product.o")).unwrap();
         assert!(restored_value == b"first" || restored_value == b"second");
+    }
+
+    #[tokio::test]
+    async fn candidate_index_retains_only_the_most_recent_bounded_set() {
+        let storage = MemoryStorage::default();
+        let mut published_ids = Vec::new();
+        for value in 0..(MAX_CANDIDATES + 3) {
+            let source = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(source.path().join("probe-hash/session")).unwrap();
+            std::fs::write(
+                source.path().join("probe-hash/session/work-product.o"),
+                value.to_le_bytes(),
+            )
+            .unwrap();
+            let archive = create_snapshot("probe", source.path()).unwrap();
+            published_ids.push(blake3::hash(&archive).to_hex().to_string());
+            publish(&storage, "namespace", "probe", source.path())
+                .await
+                .unwrap();
+        }
+
+        let entries = storage.0.lock().unwrap();
+        let index_bytes = entries.get(&index_key("namespace")).unwrap();
+        let mut cache = CacheRead::from(Cursor::new(index_bytes.clone())).unwrap();
+        let mut index_bytes = Vec::new();
+        cache.get_object(INDEX_ENTRY, &mut index_bytes).unwrap();
+        let index: CandidateIndex = serde_json::from_slice(&index_bytes).unwrap();
+
+        assert_eq!(index.candidates.len(), MAX_CANDIDATES);
+        assert_eq!(
+            index.candidates,
+            published_ids
+                .into_iter()
+                .rev()
+                .take(MAX_CANDIDATES)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

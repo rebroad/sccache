@@ -14,6 +14,12 @@
 | Concurrent publishing | PASS |
 | Corruption fallback | PASS |
 | Eviction fallback | PASS |
+| Partial-upload visibility safety | PASS |
+| Feature-change fallback | PASS |
+| RUSTFLAGS-change fallback | PASS |
+| Target-triple fallback | PASS |
+| rustc-version-mismatch fallback | PASS |
+| Changed path-dependency fallback | PASS |
 | Real-workspace benchmark completed | PASS |
 | Demonstrated performance improvement | INCONCLUSIVE |
 
@@ -79,6 +85,10 @@ arbitrary compiler ICEs or format-specific rejections remain untested.
 `truncated_snapshot_with_valid_object_id_is_rejected_cleanly` also verifies a
 truncated tar whose digest matches its published id is rejected and its private
 restore directory removed; the surrounding build retry remains unverified.
+`incomplete_snapshot_upload_is_never_published_as_a_candidate` injects a
+storage failure during manifest upload and during index publication. In both
+cases restore sees no candidate; the latter leaves only an orphaned complete
+immutable object.
 Remote transfer passes with the repository's Redis backend: Redis contained
 incremental object and index keys, and the consumer's local cache stayed empty.
 Concurrent publishing passes in both backends. The direct script exercises two
@@ -93,6 +103,33 @@ mutable entry and is published after the complete object. Concurrent index
 updates are last-writer-wins hints: one writer may orphan an immutable object,
 but cannot alter or corrupt another writer's snapshot. Local disk and Redis
 backends, including concurrent Redis writers, have been tested.
+
+### Compatibility and fallback matrix
+
+These Redis/container cases ran with the v4 chunked object format on
+rustc 1.98.1 / x86_64 Linux. Each run builds a producer in a separate
+container filesystem, then runs a consumer against the same Redis backend.
+The negative cases assert rustc did not load incremental state and compare the
+result with a clean build. Every command below was run with
+`TMPDIR=/var/tmp`, `SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache`,
+and `RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc`.
+
+| Case | Command/environment | Result |
+| --- | --- | --- |
+| Feature/cfg change | `SCCACHE_TEST_EXTRA_CFG=1 tests/rust-incremental-container-reuse.sh` | no predecessor restore; clean output matched |
+| Compiler flag change | `SCCACHE_TEST_EXTRA_RUSTFLAGS=1 tests/rust-incremental-container-reuse.sh` | no predecessor restore; clean output matched |
+| Target change | `SCCACHE_TEST_TARGET_TRIPLE=i686-unknown-linux-gnu tests/rust-incremental-container-reuse.sh` | no restore; clean i686 object verified |
+| rustc version mismatch | `SCCACHE_TEST_RUSTC_VERSION_MISMATCH=1 tests/rust-incremental-container-reuse.sh` | rustc 1.93 consumer did not restore rustc 1.98 state; clean output matched |
+| Corrupt object records | `SCCACHE_TEST_CORRUPT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh` | all Redis manifest/chunk records corrupted; fallback output matched clean |
+| Evicted objects / stale index | `SCCACHE_TEST_EVICT_SNAPSHOTS=1 tests/rust-incremental-container-reuse.sh` | objects removed while index retained; fallback output matched clean |
+| Changed path dependency | `tests/rust-incremental-cargo-poc.sh` | predecessor rejected; output matched clean |
+| Concurrent Redis publishers | default `tests/rust-incremental-container-reuse.sh` | two independent writers raced; later reader loaded and reused rustc state |
+| Bounded index | `candidate_index_retains_only_the_most_recent_bounded_set` | index retained exactly the latest eight candidates |
+| Interrupted publication | `incomplete_snapshot_upload_is_never_published_as_a_candidate` | failed manifest/index writes were invisible to restore |
+
+All scenarios above passed on 2026-09-24. These checks cover one Linux host
+architecture and compiler family. Cross-architecture host portability,
+proc-macro output, and debug-info behavior remain unverified.
 
 ## Current sccache behavior
 
@@ -457,6 +494,8 @@ review.
 - `tests/Dockerfile.rust-incremental`
 - `tests/rust-incremental-container-consumer.sh`
 - `tests/rust-incremental-container-reuse.sh`
+- `tests/rust-incremental-fresh-target.sh`
+- `tests/rust-incremental-workspace-benchmark.sh`
 - `docs/RustIncrementalSnapshots.md`
 - `docs/Rust.md`
 - `docs/Configuration.md`
