@@ -1,5 +1,29 @@
 Continue the existing Rust incremental snapshot work in the current sccache repository.
 
+============================================================
+FRESH-BUILDER DEPENDENCY ARTIFACT CLARIFICATION
+============================================================
+
+Builder B must start with an empty Cargo target directory. This prohibits
+Builder B from inheriting Builder A's live/local target state by copying,
+sharing, or bind-mounting Builder A's target tree outside the cache protocol.
+It does NOT prohibit cached dependency reuse. Dependency artifacts may and
+should be restored through ordinary sccache exact-cache hits when available:
+
+    Builder A builds dependency
+        -> sccache stores exact artifact
+    Builder B starts with empty target/
+        -> Cargo invokes dependency compilation
+        -> sccache exact-cache hit materializes artifact in Builder B target/
+        -> sccache looks up an incremental predecessor for the dependent crate
+
+This is valid fresh-builder evidence. Directly reusing/copying/mounting
+Builder A's target/deps, or any equivalent out-of-band target-tree inheritance,
+is not. The constraint is intended to expose dependency-identity instability
+when a fresh worker reconstructs its target tree. If incremental snapshots
+require byte-identical dependency artifacts, investigate whether ordinary
+sccache exact-cache restoration can preserve that identity.
+
 Do NOT restart the investigation from scratch and do NOT merely produce another design document. The existing prototype has already demonstrated that:
 
 - whole-directory rustc incremental snapshots can be captured and restored through sccache;
