@@ -503,3 +503,13 @@ The main goal is achieved only when this workflow works:
 while concurrent builders and cache corruption cannot cause incorrect compiler output.
 
 Begin with the different-checkout failure. Determine exactly why rustc currently rejects the restored state, fix or correctly normalize that incompatibility, and prove genuine incremental reuse before moving on to remote cross-machine support.
+
+============================================================
+ADDITIONAL BWRAP / SANDBOX REQUIREMENT
+============================================================
+
+Also explore how sccache can work inside the bwrap sandbox Codex uses without
+requiring build commands to be escalated. Do not rely on Codex providing local
+IPC paths or services inside bwrap. Prefer a supported sccache-owned mode or
+other mechanism that works without changing bwrap. Verify the exact sandbox
+path and document any remaining network or filesystem limits.

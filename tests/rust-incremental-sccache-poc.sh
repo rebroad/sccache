@@ -7,11 +7,13 @@ if [[ "$(uname -s)" != Linux ]]; then
 fi
 
 sccache_bin=${SCCACHE_BIN:-sccache}
+rustc_bin=${RUSTC_BIN:-rustc}
 root=$(mktemp -d /var/tmp/sccache-incremental-e2e.XXXXXX)
 cleanup() {
     local status=$?
     if [[ "$status" -ne 0 ]]; then
-        for log in "$root/first.log" "$root/second.log"; do
+        for log in "$root/first.log" "$root/same-checkout.log" "$root/second.log" \
+            "$root/concurrent-a.log" "$root/concurrent-b.log" "$root/concurrent-reader.log"; do
             if [[ -f "$log" ]]; then
                 cat "$log" >&2
             fi
@@ -22,7 +24,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$root/checkout-a" "$root/cache"
+printf 'rustc version:\n'
+"$rustc_bin" -Vv
+printf 'platform: '
+uname -a
+
+mkdir -p "$root/checkout-a" "$root/checkout-b" "$root/cache"
 : > "$root/sccache.conf"
 export SCCACHE_CONF="$root/sccache.conf"
 export SCCACHE_DIR="$root/cache"
@@ -36,15 +43,18 @@ export SCCACHE_LOG=debug
 for i in $(seq 0 127); do
     printf 'pub fn f%s() -> u32 { %s }\n' "$i" "$i" >> "$root/checkout-a/lib.rs"
 done
-compile_args=(rustc --crate-name snapshot_poc --crate-type lib --edition=2021
-    --emit=metadata,link -Z incremental-info -C opt-level=0)
+printf 'pub fn source_path() -> &\x27static str { file!() }\n' >> "$root/checkout-a/lib.rs"
+cp "$root/checkout-a/lib.rs" "$root/checkout-b/lib.rs"
+compile_args=("$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021
+    --emit=metadata,link -Z incremental-info -C opt-level=0
+    -Z remap-cwd-prefix=/sccache-workspace)
 
 (
     cd "$root/checkout-a"
     mkdir -p out
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
-        -C incremental=incremental \
+        -Z assert-incr-state=not-loaded -C incremental=incremental \
         --out-dir out lib.rs 2> "$root/first.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
@@ -53,12 +63,33 @@ compile_args=(rustc --crate-name snapshot_poc --crate-type lib --edition=2021
 
 (
     cd "$root/checkout-a"
+    sed -i 's/f1() -> u32 { 1 }/f1() -> u32 { 10 }/' lib.rs
+    rm -rf incremental
+    mkdir -p out
+    start_ns=$(date +%s%N)
+    "$sccache_bin" "${compile_args[@]}" \
+        -Z assert-incr-state=loaded -C incremental=incremental \
+        --out-dir out lib.rs 2> "$root/same-checkout.log"
+    elapsed_ns=$(($(date +%s%N) - start_ns))
+    printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
+        "$(((elapsed_ns % 1000000000) / 1000000))" > "$root/same-checkout.seconds"
+)
+
+grep -F 'restored Rust incremental snapshot' "$root/same-checkout.log" >/dev/null
+grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/same-checkout.log"
+if grep -F 'completely ignoring cache' "$root/same-checkout.log" >/dev/null; then
+    echo "rustc rejected the restored incremental state" >&2
+    exit 1
+fi
+
+(
+    cd "$root/checkout-b"
     sed -i 's/f64() -> u32 { 64 }/f64() -> u32 { 640 }/' lib.rs
     rm -rf incremental
     mkdir -p out
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
-        -C incremental=incremental \
+        -Z assert-incr-state=loaded -C incremental=incremental \
         --out-dir out lib.rs 2> "$root/second.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
@@ -68,37 +99,89 @@ compile_args=(rustc --crate-name snapshot_poc --crate-type lib --edition=2021
 grep -F 'restored Rust incremental snapshot' "$root/second.log" >/dev/null
 grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/second.log"
 if grep -F 'completely ignoring cache' "$root/second.log" >/dev/null; then
-    echo "rustc rejected the restored incremental state" >&2
+    echo "rustc rejected the cross-checkout incremental state" >&2
     exit 1
 fi
 test ! -e "$SCCACHE_SERVER_UDS"
 
-cat > "$root/main.rs" <<'EOF'
+cat > "$root/main.rs" <<EOF
 fn main() {
     assert_eq!(snapshot_poc::f64(), 640);
+    assert_eq!(snapshot_poc::f1(), 1);
     assert_eq!(snapshot_poc::f127(), 127);
+    println!("{}", snapshot_poc::source_path());
 }
 EOF
-rustc "$root/main.rs" --extern "snapshot_poc=$root/checkout-a/out/libsnapshot_poc.rlib" \
+RUSTC_BOOTSTRAP=1 "$rustc_bin" "$root/main.rs" --extern "snapshot_poc=$root/checkout-b/out/libsnapshot_poc.rlib" \
     -o "$root/checkout-a/check"
-"$root/checkout-a/check"
+"$root/checkout-a/check" > "$root/incremental-program.out"
 
 mkdir -p "$root/clean"
-rustc --crate-name snapshot_poc --crate-type lib --edition=2021 --emit=metadata,link \
-    "$root/checkout-a/lib.rs" --out-dir "$root/clean"
-rustc "$root/main.rs" --extern "snapshot_poc=$root/clean/libsnapshot_poc.rlib" \
+(
+    cd "$root/checkout-b"
+    RUSTC_BOOTSTRAP=1 "$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021 \
+        --emit=metadata,link -Z remap-cwd-prefix=/sccache-workspace \
+        lib.rs --out-dir "$root/clean"
+)
+RUSTC_BOOTSTRAP=1 "$rustc_bin" "$root/main.rs" --extern "snapshot_poc=$root/clean/libsnapshot_poc.rlib" \
     -o "$root/clean/check"
-"$root/clean/check"
+"$root/clean/check" > "$root/clean-program.out"
+printf 'incremental file! value: '
+cat "$root/incremental-program.out"
+printf 'clean file! value: '
+cat "$root/clean-program.out"
+cmp "$root/incremental-program.out" "$root/clean-program.out"
+printf 'file!() runtime value: '
+cat "$root/incremental-program.out"
+
+# Publish from two independent compiler processes into the same compatibility
+# namespace. Their checkout and incremental directories are private.
+for builder in concurrent-a concurrent-b concurrent-reader; do
+    mkdir -p "$root/$builder"
+    cp "$root/checkout-b/lib.rs" "$root/$builder/lib.rs"
+done
+sed -i 's/f2() -> u32 { 2 }/f2() -> u32 { 20 }/' "$root/concurrent-a/lib.rs"
+sed -i 's/f3() -> u32 { 3 }/f3() -> u32 { 30 }/' "$root/concurrent-b/lib.rs"
+sed -i 's/f4() -> u32 { 4 }/f4() -> u32 { 40 }/' "$root/concurrent-reader/lib.rs"
+
+for builder in concurrent-a concurrent-b; do
+    (
+        cd "$root/$builder"
+        mkdir -p out
+        "$sccache_bin" "${compile_args[@]}" \
+            -Z assert-incr-state=not-loaded -C incremental=incremental \
+            --out-dir out lib.rs 2> "$root/$builder.log"
+    ) &
+done
+wait
+
+(
+    cd "$root/concurrent-reader"
+    mkdir -p out
+    "$sccache_bin" "${compile_args[@]}" \
+        -Z assert-incr-state=loaded -C incremental=incremental \
+        --out-dir out lib.rs 2> "$root/concurrent-reader.log"
+)
+grep -F 'restored Rust incremental snapshot' "$root/concurrent-reader.log" >/dev/null
+grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/concurrent-reader.log"
+if grep -F 'completely ignoring cache' "$root/concurrent-reader.log" >/dev/null; then
+    echo "rustc rejected snapshots published by concurrent builders" >&2
+    exit 1
+fi
 
 printf 'first miss compile seconds: '
 cat "$root/first.seconds"
 printf 'restored incremental compile seconds: '
 cat "$root/second.seconds"
+printf 'same-checkout restored compile seconds: '
+cat "$root/same-checkout.seconds"
 printf 'raw incremental snapshot bytes: '
-du -sb "$root/checkout-a/incremental" | cut -f1
+du -sb "$root/checkout-b/incremental" | cut -f1
 printf 'compressed cache directory bytes: '
 du -sb "$SCCACHE_DIR" | cut -f1
 printf 'rustc reuse evidence: '
-grep -E 'restored Rust incremental snapshot|session directory: [1-9][0-9]* files hard-linked' \
-    "$root/second.log" | tr '\n' ' '
+for log in "$root/same-checkout.log" "$root/second.log" "$root/concurrent-reader.log"; do
+    grep -E 'restored Rust incremental snapshot|session directory: [1-9][0-9]* files hard-linked' \
+        "$log" | tr '\n' ' '
+done
 printf '\n'

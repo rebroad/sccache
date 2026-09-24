@@ -152,6 +152,7 @@ pub struct ParsedArguments {
     externs: Vec<PathBuf>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
+    input: OsString,
     incremental: Option<PathBuf>,
     /// Static libraries linked to in the compile.
     staticlibs: Vec<PathBuf>,
@@ -1370,6 +1371,7 @@ fn parse_arguments_with_incremental(
         crate_types,
         externs,
         crate_link_paths,
+        input,
         incremental,
         staticlibs,
         crate_name,
@@ -1622,9 +1624,11 @@ where
             }
             for argument in &self.parsed_args.arguments {
                 let skip = match argument.get_data() {
+                    Some(Emit(_) | OutDir(_) | Extern(_) | LinkPath(_)) => true,
+                    Some(Target(_)) if self.parsed_args.target_json.is_some() => true,
                     Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental" => true,
                     Some(Unstable(ArgUnstable { opt, .. })) if opt == "assert-incr-state" => true,
-                    _ => false,
+                    _ => argument.to_os_string() == self.parsed_args.input,
                 };
                 if !skip {
                     argument.to_os_string().hash(&mut HashToDigest {
@@ -1669,11 +1673,6 @@ where
                     });
                 }
             }
-            // rustc 1.93 rejects otherwise identical state from a different checkout
-            // because its saved command line embeds the compilation context.
-            cwd.hash(&mut HashToDigest {
-                digest: &mut snapshot,
-            });
             snapshot.finish()
         });
         // 9. The cwd of the compile. This will wind up in the rlib.
@@ -3692,6 +3691,7 @@ proc_macro false
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
                 crate_link_paths: vec![],
+                input: "foo.rs".into(),
                 incremental: None,
                 staticlibs: vec![f.tempdir.path().join("libbaz.a")],
                 crate_name: "foo".into(),
