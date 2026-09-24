@@ -6,12 +6,34 @@
 | Different-checkout restore | PASS |
 | Genuine rustc work reuse | PASS |
 | Remote storage transfer | PASS |
-| Cross-machine same-host-triple reuse | PASS |
+| Separate-filesystem/container reuse | PASS |
+| Fresh target-root predecessor discovery | PASS |
+| Fresh-builder real-workspace reuse | PASS |
+| Immutable snapshot publication | PASS |
+| Bounded candidate lookup | PASS |
 | Concurrent publishing | PASS |
 | Corruption fallback | PASS |
 | Eviction fallback | PASS |
-| Real-workspace benchmark | FAIL |
+| Real-workspace benchmark completed | PASS |
 | Demonstrated performance improvement | INCONCLUSIVE |
+
+Every PASS below names its automated test or command. The container evidence is
+for separate Linux filesystems with the same host/target triple and toolchain;
+it does not prove physical-machine or cross-architecture portability.
+
+The fresh-target regression is `tests/rust-incremental-fresh-target.sh`. It
+starts Builder B with no target directory, restores a normal exact-cache hit
+for a dependency, verifies an `OUT_DIR`-sensitive dependency artifact differs
+between target roots, then asserts rustc loaded the app predecessor and
+hard-linked five work products. The restored program output matches a clean
+Builder B build. A further build changes `CARGO_TARGET_DIR` and again proves
+predecessor loading and clean-output equivalence.
+
+The real-workspace command and data are recorded under [real-workspace
+benchmark](#real-workspace-benchmark). It uses separate source checkouts and
+empty target roots for each remote case, Redis shared storage, and exact-cache
+dependency restoration. It is a functional PASS, but the measurements do not
+show a net performance improvement.
 
 Same-checkout, different-checkout, and genuine-reuse PASS evidence:
 `tests/rust-incremental-sccache-poc.sh` (including its
@@ -220,14 +242,16 @@ and object upload time. With Redis, the cache-record payload size and total
 server-side network byte deltas can be measured separately from those raw
 archive bytes.
 
-The index key is `rust-incremental-v3/<namespace>/index`; its cache object
+The index key is `rust-incremental-v4/<namespace>/index`; its cache object
 `candidates.json` stores at most eight BLAKE3 archive ids, most recent first.
-Snapshot objects use `rust-incremental-v3/<namespace>/objects/<id>` and contain
-`snapshot.tar`. The archive id hashes the complete tar bytes; readers verify
-the digest before extraction. The object is written to `Storage` before its id
-is published in the index. Missing, evicted, and hash-mismatched objects are
+Each immutable object has a `manifest.json` key and numbered 8 MiB chunk keys
+under `objects/<id>/`. The manifest is stored only after every chunk, and the
+candidate index is updated only after the manifest. This sibling-key layout
+works with hierarchical local storage as well as Redis. The archive id hashes
+the complete reconstructed tar bytes; readers verify the digest before
+extraction. Missing, evicted, malformed, and hash-mismatched objects are
 skipped. `Storage` has no compare-and-swap, so concurrent index writes can lose
-references but cannot mutate an immutable snapshot.
+references but cannot mutate an immutable snapshot. The archive limit is 2 GiB.
 
 Rustc's saved option hash is a necessary final check, not a sufficient sccache
 namespace: it does not promise to encode host CPU/OS compatibility or protect
@@ -331,7 +355,7 @@ tests/rust-incremental-sccache-poc.sh
 ```
 
 The E2E left its `SCCACHE_DIR` empty, and `redis-cli --scan` showed the
-`rust-incremental-v3/.../objects/...` and `/index` records. Docker bridge
+`rust-incremental-v4/.../objects/...` and `/index` records. Docker bridge
 port-forwarding was unavailable on this host, so the temporary service used
 host networking. This proves storage transfer through Redis, not cross-machine
 reuse.
@@ -340,9 +364,50 @@ It completed without escalation or a daemon socket. In the latest local disk
 run with relative source arguments, the first miss took 4.689 seconds, the
 cross-checkout restored compile 0.393 seconds, and the same-checkout restored
 compile 0.480 seconds. The B incremental state was 1,102,696 bytes; the full
-local cache directory was 914,432 bytes. Earlier tiny
-runs varied substantially, so this is not a performance claim or the requested
-real-workspace benchmark. It proves state loading and work-product reuse only.
+local cache directory was 914,432 bytes. This tiny project is correctness
+evidence, not a performance claim.
+
+## Real-workspace benchmark
+
+The exact command was:
+
+```sh
+TMPDIR=/var/tmp \
+CARGO_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo \
+RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+BENCH_BUILD_ROOT=/mnt/kingston/builds/rebroad/src/sccache.build \
+tests/rust-incremental-workspace-benchmark.sh
+```
+
+The workspace is this sccache repository (`randomize_readdir`, `sccache`),
+rustc 1.98.1 (`48a229ceaefd4985c50990b14116b6d856af0985`), x86_64 Linux. The
+baseline run is in
+`/mnt/kingston/builds/rebroad/src/sccache.build/workspace-benchmark-20260924T195603Z`;
+the final chunked-Redis run is in
+`/mnt/kingston/builds/rebroad/src/sccache.build/workspace-benchmark-20260924T203743Z`.
+Remote runs use separate source roots and empty target directories. Redis is
+the sccache storage backend; Builder B receives dependencies through exact
+cache hits. Each remote edit restored 260 hard-linked rustc work products.
+
+| Case | Wall seconds | rustc compile seconds | Snapshot evidence |
+| --- | ---: | ---: | --- |
+| Clean build, incremental disabled | 91.712 | 313.243 | no snapshot |
+| Local incremental seed | 99.045 | 324.047 | seed |
+| Local incremental small edit | 10.924 | 306.185 | 268 hard-linked files |
+| sccache exact-cache seed | 152.737 | 345.604 | 312,016,704 B local cache |
+| sccache exact-cache hit | 58.578 | 0 | 1,135 exact hits |
+| Remote incremental miss | 163.475 | 362.073 | raw snapshot 364,955,648 B; compressed record 95,637,953 B |
+| Remote small edit | 119.504 | 88.778 | restored 364,955,648 B; fetch 2,319.290 ms; unpack 242.974 ms; uploaded compressed payload 191,436,447 B |
+| Remote moderate edit | 123.705 | 94.761 | restored 730,066,432 B; fetch 4,487.078 ms; unpack 550.708 ms; uploaded compressed payload 191,824,058 B |
+
+Remote incremental results are from a later run after the baseline run; do
+not compare these as a controlled performance trial. The run confirms correct
+discovery, transfer, restore, and reuse; it does not establish a net speedup.
+Remote small/moderate builds remain slower in wall time than the 10.924-second
+local incremental edit, and the remote snapshot writes roughly 191 MB of
+compressed payload after each edit. Performance improvement is therefore
+INCONCLUSIVE and must not be claimed.
 
 ## Risks and remaining measurements
 
@@ -366,9 +431,9 @@ real-workspace benchmark. It proves state loading and work-product reuse only.
   target triples passed. This does not prove other kernel, OS, CPU-feature, or
   architecture combinations. x86_64-host to aarch64-target is not equivalent
   to aarch64-host to aarch64-target.
-- **Cost:** the prototype measures one snapshot's compressed and raw sizes.
-  Consecutive-snapshot duplication, upload/download latency, and compile-time
-  savings remain to be measured on a real Cargo workspace.
+- **Cost:** a real workspace was measured. Snapshot transfer and writes are
+  large, and current separated runs do not prove a speedup. A controlled
+  repeated benchmark is still needed before making a performance claim.
 
 ## Upstreaming boundary
 

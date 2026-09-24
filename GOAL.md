@@ -1,539 +1,317 @@
-Continue the existing Rust incremental snapshot work in the current sccache repository.
-
 ============================================================
-FRESH-BUILDER DEPENDENCY ARTIFACT CLARIFICATION
+CURRENT STATUS — THIS OVERRIDES OLDER STATUS TEXT BELOW
 ============================================================
 
-Builder B must start with an empty Cargo target directory. This prohibits
-Builder B from inheriting Builder A's live/local target state by copying,
-sharing, or bind-mounting Builder A's target tree outside the cache protocol.
-It does NOT prohibit cached dependency reuse. Dependency artifacts may and
-should be restored through ordinary sccache exact-cache hits when available:
+The following have now been demonstrated:
 
-    Builder A builds dependency
-        -> sccache stores exact artifact
-    Builder B starts with empty target/
-        -> Cargo invokes dependency compilation
-        -> sccache exact-cache hit materializes artifact in Builder B target/
-        -> sccache looks up an incremental predecessor for the dependent crate
+- Same-checkout incremental restore: PASS.
+- Different-checkout incremental restore: PASS on rustc 1.98.1,
+  x86_64 Linux.
+- Genuine rustc work-product reuse after cross-checkout restore: PASS.
+- Path-sensitive Cargo values and path-dependency changes: covered.
+- Redis/shared-storage snapshot transfer: PASS.
+- Separate container filesystems with restored incremental state and
+  genuine rustc reuse: PASS.
 
-This is valid fresh-builder evidence. Directly reusing/copying/mounting
-Builder A's target/deps, or any equivalent out-of-band target-tree inheritance,
-is not. The constraint is intended to expose dependency-identity instability
-when a fresh worker reconstructs its target tree. If incremental snapshots
-require byte-identical dependency artifacts, investigate whether ordinary
-sccache exact-cache restoration can preserve that identity.
+The Redis/container result demonstrates separate-build-environment,
+same-host-triple reuse. It does not by itself prove portability between
+different physical machines, and should be described accurately.
 
-Do NOT restart the investigation from scratch and do NOT merely produce another design document. The existing prototype has already demonstrated that:
+These successful cases are now regression requirements. Do not spend the
+main effort re-solving them unless a later change breaks them.
 
-- whole-directory rustc incremental snapshots can be captured and restored through sccache;
-- rustc can genuinely reuse restored work products;
-- same-host, same-checkout-path reuse works;
-- the current prototype uses a single mutable compatibility key;
-- remote-cache concurrency, eviction, cross-checkout portability, and cross-machine reuse are not yet solved.
+The fresh-target namespace blocker is now resolved for the sccache Cargo
+workspace. `tests/rust-incremental-workspace-benchmark.sh` demonstrated that
+Builder B starts with an empty target, reconstructs dependencies through
+normal Cargo/sccache operation, finds the predecessor after both a small and
+moderate source edit, and reuses 260 rustc work products. Both remote builds
+reported more than 1,080 exact-cache hits. The dedicated
+`tests/rust-incremental-fresh-target.sh` also verifies the restored output
+against a clean build and exercises target-root-specific `OUT_DIR` artifacts
+and `CARGO_TARGET_DIR` changes.
 
-Your next goal is to turn that proof of concept into a practical distributed incremental-cache prototype.
-
-The work has TWO required milestones, in this order.
-
-============================================================
-MILESTONE 1 — MAKE SNAPSHOTS WORK ACROSS DIFFERENT CHECKOUT PATHS
-============================================================
-
-The existing experiment shows that restoring a snapshot into a different checkout path causes rustc to reject the incremental state because of differing command-line arguments.
-
-Solve this properly.
-
-Example:
-
-Machine/build A:
-
-    /home/builder-a/project
-        revision A
-        -> rustc incremental build
-        -> snapshot stored
-
-Later:
-
-    /tmp/ci-job-928/project
-        revision B
-        -> restore snapshot from revision A
-        -> rustc must accept compatible state
-        -> unchanged work must actually be reused
-
-The checkout path must NOT need to be identical.
-
-Do not fake success by arranging for both builds to use the same absolute directory.
-
-Investigate exactly which command-line argument, tracked compiler input, crate metadata, working-directory value, remapped path, environment variable, or incremental fingerprint causes rustc to invalidate the restored state.
-
-Use rustc diagnostics/incremental debugging facilities to prove the cause.
-
-Evaluate mechanisms such as:
-
-- rustc path remapping;
-- `--remap-path-prefix`;
-- normalized working directories;
-- canonical logical workspace roots;
-- changing how sccache invokes rustc;
-- changing compatibility metadata;
-- changes to rustc only if unavoidable.
-
-Do NOT disable rustc correctness checks merely to make the snapshot load.
-
-The preferred outcome is that semantically equivalent builds from different checkout roots look equivalent to rustc while diagnostics/debug info remain correct or deliberately remapped.
-
-Be careful about:
-
-- `file!()`;
-- `env!()` / `option_env!()`;
-- debug info;
-- dep-info;
-- build scripts;
-- proc macros;
-- absolute source paths embedded into outputs;
-- Cargo metadata;
-- path dependencies;
-- `OUT_DIR`;
-- target directory differences.
-
-If path normalization changes observable Rust program behavior, document that explicitly.
-
-Success criterion for Milestone 1:
-
-Create an automated test that:
-
-1. builds revision A in checkout/path A;
-2. stores the incremental snapshot;
-3. creates a separate checkout/path B;
-4. modifies at least one function or module;
-5. deletes any naturally inherited incremental state in B;
-6. restores the state from A through sccache;
-7. runs rustc normally;
-8. proves that rustc accepted the snapshot;
-9. proves that at least some previous work products or queries were genuinely reused;
-10. compares the resulting program/library against a clean build for correctness.
-
-Do not use wall-clock timing alone as evidence of reuse.
-
-Record the exact rustc version and platform used.
-
-If this cannot be made correct without modifying rustc, identify the exact rustc limitation and implement the smallest appropriate rustc-side experiment rather than hiding the failure.
+This resolves the fresh-builder functional milestone on rustc 1.98.1,
+x86_64 Linux with Redis shared storage. It does not establish a performance
+improvement: the remote edits are much slower than a local incremental edit.
+Continue the remaining matrix, failure-mode, security, and reproducibility
+work; do not rewrite this resolved milestone as a remaining blocker.
 
 ============================================================
-MILESTONE 2 — REAL REMOTE, CROSS-MACHINE REUSE
+REGRESSION REQUIREMENT — FRESH-BUILDER PREDECESSOR DISCOVERY
 ============================================================
 
-Once Milestone 1 works, implement and demonstrate:
+Keep this workflow passing:
 
-    Machine A
-        |
-        | incremental build
-        v
-    sccache remote/shared storage
-        |
-        | snapshot transfer
-        v
-    Machine B
-        |
-        | different checkout path
-        | same compatible rustc/toolchain
-        v
-    restored rustc incremental state
-        |
-        v
-    genuine incremental reuse
+    Builder A
+        source root A
+        fresh target root A
+        build revision N
+        dependencies built/restored normally
+        publish incremental snapshot
+              |
+              v
+        shared sccache storage
+              |
+              v
+    Builder B
+        different source root B
+        initially empty target root B
+        dependencies reconstructed normally through Cargo/sccache
+        build revision N+1
+              |
+              v
+        exact output cache miss for changed crate
+              |
+              v
+        compatible incremental predecessor discovered
+              |
+              v
+        snapshot restored privately
+              |
+              v
+        rustc validates it
+              |
+              v
+        rustc genuinely reuses previous compiler work
+              |
+              v
+        correct output matching a clean build
 
-The machines may be containers/VMs if necessary, but they must have separate filesystems and must not share the live rustc incremental directory.
+Builder B MUST NOT inherit Builder A's target tree through copying,
+sharing, bind mounts, or another out-of-band mechanism.
 
-Initially constrain compatibility to:
-
-- same rustc version/build identity;
-- same rustc host triple;
-- same target triple;
-- same relevant compiler configuration.
-
-Do NOT attempt cross-host-architecture portability yet.
-
-For example, proving:
-
-    x86_64 Linux machine A
-        ->
-    x86_64 Linux machine B
-
-is sufficient.
-
-Do not claim support for:
-
-    x86_64 host
-        ->
-    aarch64 host
-
-unless separately proven.
+However, dependency artifacts MAY and SHOULD be restored through ordinary
+sccache exact-cache hits. Cached dependency reuse is part of the intended
+distributed-build workflow.
 
 ============================================================
-REPLACE THE SINGLE MUTABLE SNAPSHOT KEY
+SEPARATE EXACT-OUTPUT IDENTITY FROM PREDECESSOR IDENTITY
 ============================================================
 
-The current prototype's single mutable compatibility key is not sufficient for a real shared cache.
+Investigate whether values appropriate for an ordinary exact-output
+sccache key are incorrectly being reused in the incremental predecessor
+compatibility namespace.
 
-Replace it with a safe snapshot publication model.
+These are different questions:
 
-Use immutable snapshot objects.
+    Exact-output lookup:
+        "Have these exact compilation inputs already produced an output?"
 
-Conceptually:
+    Incremental predecessor lookup:
+        "Is there a sufficiently compatible previous compiler state that
+         rustc may be able to reuse?"
+
+The predecessor namespace does NOT need to prove a snapshot valid.
+It only needs to find plausible candidates.
+
+rustc remains the authoritative validator.
+
+Therefore prefer:
 
     compatibility namespace
-        |
-        +--> snapshot object A
-        +--> snapshot object B
-        +--> snapshot object C
-
-Each snapshot object should be immutable once published.
-
-Snapshot objects should preferably be content-addressed or otherwise uniquely identified.
-
-Create a bounded candidate-index mechanism so a request can find a small number of previous compatible snapshots.
-
-The index must tolerate:
-
-- concurrent writers;
-- last-writer races;
-- missing/evicted snapshot objects;
-- partially failed publication;
-- stale index entries.
-
-A reader must never observe or use a partially uploaded snapshot.
-
-Prefer this publication ordering:
-
-    create complete snapshot
         ->
-    upload immutable object
+    bounded plausible candidate set
         ->
-    verify/store successfully
+    private restore
         ->
-    publish/update candidate reference
+    rustc validity/invalidation checks
 
-Never mutate a remotely shared rustc incremental directory in place.
+over an exact namespace so restrictive that potentially useful snapshots
+are never found.
 
-Each build should:
+It is acceptable for predecessor lookup to produce occasional false-positive
+candidates that rustc rejects.
 
-    download snapshot
-        ->
-    restore into private local directory
-        ->
-    invoke rustc
-        ->
-    allow rustc to mutate private state
-        ->
-    publish a new immutable snapshot
+It is undesirable for lookup to produce false negatives merely because
+target-root-specific artifact names, paths, or hashes differ when rustc
+could safely determine what remains reusable.
 
 ============================================================
-PREDECESSOR SELECTION
+DIAGNOSE THE DEPENDENCY IDENTITY DIFFERENCE
 ============================================================
 
-Do not require Git history for the core implementation.
+Add structured diagnostics explaining why two builds do or do not share
+an incremental predecessor namespace.
 
-Create a conservative compatibility namespace from appropriate inputs such as:
+For representative dependencies compare:
 
-- rustc compiler identity;
-- rustc host triple;
-- target triple;
-- crate/package identity;
-- relevant compiler options;
-- Cargo profile/configuration;
-- feature configuration;
-- dependency identity where appropriate;
-- codegen/backend settings;
-- environment values that affect compilation.
+- logical dependency identity;
+- artifact filename;
+- absolute artifact path;
+- artifact byte digest;
+- rustc invocation;
+- `-C metadata`;
+- `-C extra-filename`;
+- `--extern` values;
+- build-script outputs;
+- OUT_DIR-derived values;
+- relevant environment variables;
+- Cargo feature/profile configuration.
 
-Do NOT include the current source-content hash in the compatibility namespace in a way that makes every source edit produce a separate namespace.
+When no predecessor is found, provide a diagnostic resembling:
 
-The whole point is to locate previous state for a changed revision.
+    rustc identity                    equal
+    host triple                       equal
+    target triple                     equal
+    crate/package identity            equal
+    profile                           equal
+    features                          equal
 
-Keep ordinary sccache exact-output caching unchanged:
+    dependency foo logical identity   equal
+    dependency foo artifact path      DIFFERENT
+    dependency foo filename           DIFFERENT
+    dependency foo byte digest        equal/different
 
-    exact output cache lookup
-        |
-        +-- hit --> return output immediately
-        |
-        +-- miss
-             |
-             v
-        incremental predecessor lookup
-             |
-             +-- candidate --> restore and run rustc
-             |
-             +-- none ------> normal incremental/clean compilation
+Do not stop at "dependency hashes differ."
 
-The existing exact cache remains the fastest path.
+Determine exactly which dependency value differs and why.
 
-For the first implementation, choosing the most recent compatible snapshot is acceptable if correctness is preserved.
+Distinguish clearly between:
 
-Support a small bounded candidate list if practical.
+    A. sccache did not discover a candidate
 
-Do not build an elaborate Git ancestry system unless measurements prove it is necessary.
+and:
 
-============================================================
-CORRUPTION AND FALLBACK
-============================================================
+    B. sccache restored a candidate but rustc rejected/invalidated it
 
-A bad remote snapshot must never break a build permanently.
-
-Test:
-
-- truncated archive;
-- missing files;
-- corrupted archive;
-- rustc rejecting restored state;
-- incompatible compiler;
-- incompatible target/configuration;
-- index pointing to an evicted object.
-
-Expected behavior:
-
-    restore attempt
-        ->
-    rustc or sccache rejects state
-        ->
-    discard private restored copy
-        ->
-    retry safely without the snapshot
-        ->
-    successful correct build
-
-No cache state may become authoritative over rustc's own validity checks.
+Those are separate failures.
 
 ============================================================
-CONCURRENCY TEST
+MINIMAL REPRODUCTION
 ============================================================
 
-Create a test with at least two independent builders publishing into the same compatibility namespace concurrently.
+Before repeatedly debugging the large workspace, create a small Cargo
+workspace that reproduces the fresh-target-root divergence:
 
-Verify that:
+    app
+      -> path dependency lib
 
-- neither corrupts the other's snapshot;
-- readers never see partial data;
-- losing an index race does not invalidate a successfully stored immutable snapshot;
-- subsequent builds can still find a usable candidate;
-- the cache remains correct if one candidate is evicted.
+Build it in:
 
-============================================================
-REMOTE BACKEND
-============================================================
+    source root A + target root A
 
-Use an actual sccache shared/remote storage implementation where practical.
+and:
 
-If testing a production cloud backend is impractical, use the closest repository-supported backend suitable for deterministic automated tests.
+    source root B + target root B
 
-Do not simulate "remote" reuse by copying directories manually outside sccache.
+Compare the dependency identity inputs listed above.
 
-Snapshot storage/retrieval must flow through the sccache storage abstraction.
+Then progressively add, where necessary:
 
-Document any backend assumptions.
+- dependency source changes;
+- features;
+- build.rs;
+- OUT_DIR;
+- proc macros;
+- transitive dependencies.
 
-============================================================
-PERFORMANCE VALIDATION
-============================================================
-
-After correctness is established, benchmark at least one nontrivial Cargo workspace.
-
-Measure these cases:
-
-1. clean build with incremental disabled;
-2. ordinary local rustc incremental rebuild;
-3. existing sccache exact cache behavior;
-4. remote incremental snapshot miss;
-5. remote incremental snapshot hit after a small source edit;
-6. remote incremental snapshot hit after a moderate edit.
-
-Report:
-
-- wall-clock build time;
-- rustc time where available;
-- snapshot raw size;
-- compressed size;
-- bytes uploaded;
-- bytes downloaded;
-- extraction/restoration time;
-- rustc incremental reuse evidence;
-- amount/type of work reused where diagnostics allow;
-- resulting cache size.
-
-Do not claim the approach improves performance unless measurements show it.
-
-If snapshot transfer costs exceed saved compilation time, report that clearly.
+Use this to identify which values should participate in predecessor
+discovery and which should instead be left to rustc's final validation.
 
 ============================================================
-TEST MATRIX
+REAL-WORKSPACE REQUIREMENT
 ============================================================
 
-At minimum, automate:
+Keep the real-workspace requirement strict.
 
-- same checkout, small edit;
-- different checkout, small edit;
-- different checkout, module edit;
-- same architecture, separate machine/container;
-- feature change;
-- `RUSTFLAGS` change;
-- dependency change;
-- target change;
-- rustc version mismatch;
-- corrupted snapshot;
-- missing snapshot;
-- evicted snapshot;
-- concurrent writers.
+The real-workspace functional milestone now passes for the sccache workspace
+on the platform and toolchain recorded above. Keep it as a regression
+requirement. Broader target/configuration combinations remain to be tested.
 
-The correct result for some configuration changes may be snapshot rejection.
+- Builder B begins with an empty target tree;
+- dependencies are reconstructed normally, including sccache exact hits;
+- a source edit causes the normal exact output lookup to miss;
+- sccache still discovers an incremental predecessor;
+- rustc actually loads useful restored state;
+- rustc demonstrably reuses compiler work;
+- the output agrees with a clean build.
 
-That is success if the fallback is correct.
+Do not preserve Builder A's target/deps merely to make this pass.
 
 ============================================================
-SECURITY
+PERFORMANCE
 ============================================================
 
-Keep this feature experimental and opt-in.
+Latest real-workspace snapshot measurements are approximately:
 
-Do not treat remote incremental compiler state as inherently trusted.
+    362 MB raw
+    95 MB compressed/Redis payload
 
-Document the trust boundary.
+should be recorded as a concern.
 
-Ensure archive extraction cannot trivially write outside the intended incremental-state directory.
+Snapshot chunks were introduced because the Redis client response timeout
+prevented retrieval of large single records. The current chunked layout uses
+8 MiB chunks; this correctness fix does not establish that the overall format
+is efficient. Continue to measure separately:
 
-Check for unsafe archive paths such as:
+1. FUNCTIONAL SUCCESS
+   - Was a predecessor discovered?
+   - Was it restored?
+   - Did rustc reuse compiler work?
 
-    ../../something
-    /absolute/path
-    symlink-based escapes
+2. PERFORMANCE SUCCESS
+   - Was retrieving/restoring the snapshot actually cheaper than recomputing
+     the compiler work?
 
-If the current prototype extracts archives unsafely, fix that before remote-cache support is considered usable.
-
-Do not claim arbitrary untrusted remote caches are safe unless that has actually been established.
-
-============================================================
-CONFIGURATION
-============================================================
-
-Keep the feature behind an explicit experimental flag.
-
-Preserve current default sccache behavior.
-
-Existing non-incremental Rust caching and other compiler caching must continue working unchanged.
-
-Do not require users to set undocumented combinations of environment variables just to make the normal prototype work.
-
-Document the minimal configuration.
+A functional PASS with a performance FAIL or INCONCLUSIVE result is a valid
+research outcome.
 
 ============================================================
-DO NOT DO THESE THINGS
+REMAINING DISTRIBUTED-CACHE WORK
 ============================================================
 
-Do NOT:
+Continue to track these independently:
 
-- merely remove the incremental-compilation rejection;
-- fake cross-checkout testing with identical filesystem paths;
-- infer incremental reuse from wall-clock timing;
-- use a manually copied directory instead of the sccache storage path;
-- disable rustc validity checks;
-- declare cross-machine support after testing only one filesystem namespace;
-- declare concurrency solved while retaining a single mutable snapshot key;
-- claim cross-architecture support without testing it;
-- redesign rustc's entire query system;
-- start with fine-grained distributed query caching;
-- spend the entire task writing another architecture document.
+- immutable snapshot publication;
+- bounded candidate indexing;
+- concurrent publisher safety;
+- stale-index handling;
+- eviction fallback;
+- corruption fallback;
+- archive/path traversal safety;
+- partial-upload safety.
 
-Modify code, run tests, and demonstrate the behavior.
+Redis transfer alone does not make these PASS.
 
 ============================================================
-DELIVERABLE
+UPDATED STATUS TABLE
 ============================================================
 
-At the end, update `RustIncrementalSnapshots.md`.
+Use at least:
 
-Start it with a concise status table:
+    Capability                                      Status
+    -----------------------------------------------------------------
+    Same-checkout restore                           PASS/FAIL
+    Different-checkout restore                      PASS/FAIL
+    Genuine rustc work reuse                        PASS/FAIL
+    Redis/shared-storage snapshot transfer          PASS/FAIL
+    Separate-filesystem/container reuse             PASS/FAIL
+    Fresh target-root predecessor discovery         PASS/FAIL
+    Fresh-builder real-workspace reuse              PASS/FAIL
+    Immutable snapshot publication                  PASS/FAIL
+    Bounded candidate lookup                        PASS/FAIL
+    Concurrent publishing                           PASS/FAIL
+    Corruption fallback                             PASS/FAIL
+    Eviction/stale-index fallback                   PASS/FAIL
+    Real-workspace functional reuse                 PASS/FAIL
+    Real-workspace benchmark completed              PASS/FAIL
+    Demonstrated net performance improvement        PASS/FAIL/INCONCLUSIVE
 
-    Capability                              Status
-    ---------------------------------------------------------
-    Same-checkout incremental restore       PASS/FAIL
-    Different-checkout restore              PASS/FAIL
-    Genuine rustc work reuse                PASS/FAIL
-    Remote storage transfer                 PASS/FAIL
-    Cross-machine same-host-triple reuse    PASS/FAIL
-    Concurrent publishing                   PASS/FAIL
-    Corruption fallback                     PASS/FAIL
-    Eviction fallback                       PASS/FAIL
-    Real-workspace benchmark                PASS/FAIL
-    Demonstrated performance improvement    PASS/FAIL/INCONCLUSIVE
-
-For every PASS, provide the exact automated test or command that demonstrates it.
-
-For every FAIL or INCONCLUSIVE result, explain the blocker without disguising it as completed work.
-
-Also include:
-
-- files changed;
-- architecture implemented;
-- cache key/namespace design;
-- snapshot/index format;
-- rustc compatibility behavior;
-- test results;
-- benchmark results;
-- security limitations;
-- remaining blockers;
-- what would be required before proposing the feature upstream.
+Every PASS must point to the exact automated test demonstrating it.
 
 ============================================================
-DEFINITION OF SUCCESS
+CURRENT DEFINITION OF SUCCESS
 ============================================================
 
-The main goal is achieved only when this workflow works:
+This milestone is achieved when a genuinely fresh Builder B,
+with a different source root and initially empty target root, reconstructs
+dependencies through normal Cargo/sccache operation, misses the exact cache
+for the changed crate, discovers a compatible incremental predecessor,
+restores it privately, and rustc demonstrably reuses prior work while
+producing output matching a clean build.
 
-    separate build environment A
-        |
-        | build revision N
-        v
-    sccache stores incremental snapshot
-        |
-        v
-    shared/remote cache
-        |
-        v
-    separate build environment B
-        |
-        | different checkout path
-        | revision N+1
-        v
-    ordinary exact sccache lookup misses
-        |
-        v
-    sccache finds compatible incremental predecessor
-        |
-        v
-    snapshot restored privately
-        |
-        v
-    rustc validates snapshot
-        |
-        v
-    rustc genuinely reuses previous work
-        |
-        v
-    correct output produced
-        |
-        v
-    updated immutable snapshot safely published
+The remaining questions are:
 
-while concurrent builders and cache corruption cannot cause incorrect compiler output.
-
-Begin with the different-checkout failure. Determine exactly why rustc currently rejects the restored state, fix or correctly normalize that incompatibility, and prove genuine incremental reuse before moving on to remote cross-machine support.
-
-============================================================
-ADDITIONAL BWRAP / SANDBOX REQUIREMENT
-============================================================
-
-Also explore how sccache can work inside the bwrap sandbox Codex uses without
-requiring build commands to be escalated. Do not rely on Codex providing local
-IPC paths or services inside bwrap. Prefer a supported sccache-owned mode or
-other mechanism that works without changing bwrap. Verify the exact sandbox
-path and document any remaining network or filesystem limits.
+    Which required configuration, corruption, eviction, concurrency, and
+    platform cases remain unverified, and what controlled repeated benchmark
+    is needed to assess performance?

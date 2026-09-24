@@ -6,14 +6,24 @@ use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
-const SNAPSHOT_ENTRY: &str = "snapshot.tar";
+const MANIFEST_ENTRY: &str = "manifest.json";
+const CHUNK_ENTRY: &str = "chunk.bin";
 const INDEX_ENTRY: &str = "candidates.json";
 const MAX_CANDIDATES: usize = 8;
-const SNAPSHOT_FORMAT: &str = "rust-incremental-v3";
+const SNAPSHOT_FORMAT: &str = "rust-incremental-v4";
+const SNAPSHOT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct CandidateIndex {
     candidates: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotManifest {
+    archive_bytes: u64,
+    chunk_bytes: u32,
+    chunk_count: u32,
 }
 
 pub(crate) async fn restore(
@@ -33,13 +43,53 @@ pub(crate) async fn restore(
         serde_json::from_slice(&index_bytes).context("invalid Rust incremental candidate index")?;
     for object_id in index.candidates.into_iter().take(MAX_CANDIDATES) {
         let fetch_started = Instant::now();
-        let Cache::Hit(mut cache) = storage.get(&object_key(namespace, &object_id)).await? else {
+        let Cache::Hit(mut cache) = storage.get(&manifest_key(namespace, &object_id)).await? else {
             continue;
         };
-        let mut bytes = Vec::new();
-        if cache.get_object(SNAPSHOT_ENTRY, &mut bytes).is_err()
-            || blake3::hash(&bytes).to_hex().as_str() != object_id
+        let mut manifest_bytes = Vec::new();
+        if cache
+            .get_object(MANIFEST_ENTRY, &mut manifest_bytes)
+            .is_err()
         {
+            continue;
+        }
+        let Ok(manifest) = serde_json::from_slice::<SnapshotManifest>(&manifest_bytes) else {
+            continue;
+        };
+        if manifest.archive_bytes == 0
+            || manifest.archive_bytes > MAX_SNAPSHOT_ARCHIVE_BYTES
+            || manifest.chunk_bytes as usize != SNAPSHOT_CHUNK_BYTES
+            || u64::from(manifest.chunk_count)
+                != manifest
+                    .archive_bytes
+                    .div_ceil(u64::from(manifest.chunk_bytes))
+        {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let mut complete = true;
+        for chunk_index in 0..manifest.chunk_count {
+            let Cache::Hit(mut chunk_cache) = storage
+                .get(&chunk_key(namespace, &object_id, chunk_index))
+                .await?
+            else {
+                complete = false;
+                break;
+            };
+            let mut chunk = Vec::new();
+            if chunk_cache.get_object(CHUNK_ENTRY, &mut chunk).is_err() {
+                complete = false;
+                break;
+            }
+            let expected_bytes =
+                (manifest.archive_bytes - bytes.len() as u64).min(u64::from(manifest.chunk_bytes));
+            if chunk.len() as u64 != expected_bytes {
+                complete = false;
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !complete || blake3::hash(&bytes).to_hex().as_str() != object_id {
             continue;
         }
         let fetch_elapsed = fetch_started.elapsed();
@@ -48,8 +98,9 @@ pub(crate) async fn restore(
         match unpack_snapshot(&bytes, crate_name, directory) {
             Ok(()) => {
                 debug!(
-                    "restored Rust incremental snapshot: archive_bytes={} fetch_ms={} unpack_ms={}",
+                    "restored Rust incremental snapshot: archive_bytes={} chunks={} fetch_ms={} unpack_ms={}",
                     bytes.len(),
+                    manifest.chunk_count,
                     fetch_elapsed.as_secs_f64() * 1000.0,
                     unpack_started.elapsed().as_secs_f64() * 1000.0
                 );
@@ -73,15 +124,12 @@ pub(crate) async fn publish(
     let archive = create_snapshot(crate_name, directory)?;
     let archive_bytes = archive.len();
     let object_id = blake3::hash(&archive).to_hex().to_string();
-    let mut entry = CacheWrite::new();
-    entry.put_object(SNAPSHOT_ENTRY, &mut Cursor::new(archive), None)?;
     let upload_started = Instant::now();
-    storage
-        .put(&object_key(namespace, &object_id), entry)
-        .await?;
+    let chunk_count = store_snapshot_object(storage, namespace, &object_id, &archive).await?;
     debug!(
-        "published Rust incremental snapshot: archive_bytes={} upload_ms={}",
+        "published Rust incremental snapshot: archive_bytes={} chunks={} upload_ms={}",
         archive_bytes,
+        chunk_count,
         upload_started.elapsed().as_secs_f64() * 1000.0
     );
 
@@ -105,10 +153,47 @@ pub(crate) async fn publish(
         &mut Cursor::new(serde_json::to_vec(&CandidateIndex { candidates })?),
         None,
     )?;
-    // Concurrent writers can replace this hint. Snapshot objects remain immutable;
-    // a lost index update can orphan an object but cannot corrupt another build.
+    // Publish the candidate only after every chunk and its manifest are stored.
+    // Concurrent index writes can orphan an object but cannot expose partial data.
     storage.put(&key, entry).await?;
     Ok(())
+}
+
+async fn store_snapshot_object(
+    storage: &dyn Storage,
+    namespace: &str,
+    object_id: &str,
+    archive: &[u8],
+) -> Result<u32> {
+    if archive.len() as u64 > MAX_SNAPSHOT_ARCHIVE_BYTES {
+        return Err(anyhow!(
+            "Rust incremental snapshot exceeds the {} byte limit",
+            MAX_SNAPSHOT_ARCHIVE_BYTES
+        ));
+    }
+    let chunk_count = archive.len().div_ceil(SNAPSHOT_CHUNK_BYTES) as u32;
+    for (chunk_index, chunk) in archive.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+        let mut entry = CacheWrite::new();
+        entry.put_object(CHUNK_ENTRY, &mut Cursor::new(chunk), None)?;
+        storage
+            .put(&chunk_key(namespace, object_id, chunk_index as u32), entry)
+            .await?;
+    }
+    let manifest = SnapshotManifest {
+        archive_bytes: archive.len() as u64,
+        chunk_bytes: SNAPSHOT_CHUNK_BYTES as u32,
+        chunk_count,
+    };
+    let mut entry = CacheWrite::new();
+    entry.put_object(
+        MANIFEST_ENTRY,
+        &mut Cursor::new(serde_json::to_vec(&manifest)?),
+        None,
+    )?;
+    storage
+        .put(&manifest_key(namespace, object_id), entry)
+        .await?;
+    Ok(chunk_count)
 }
 
 fn index_key(namespace: &str) -> String {
@@ -116,6 +201,12 @@ fn index_key(namespace: &str) -> String {
 }
 fn object_key(namespace: &str, id: &str) -> String {
     format!("{SNAPSHOT_FORMAT}/{namespace}/objects/{id}")
+}
+fn manifest_key(namespace: &str, id: &str) -> String {
+    format!("{}/{MANIFEST_ENTRY}", object_key(namespace, id))
+}
+fn chunk_key(namespace: &str, id: &str, index: u32) -> String {
+    format!("{}/chunks/{index:08}", object_key(namespace, id))
 }
 
 fn crate_state_path(path: &Path, crate_name: &str) -> bool {
@@ -382,7 +473,7 @@ mod tests {
             let entries = storage.0.lock().unwrap();
             let (key, bytes) = entries
                 .iter()
-                .find(|(key, _)| key.contains("/objects/"))
+                .find(|(key, _)| key.ends_with("/manifest.json"))
                 .unwrap();
             (key.clone(), bytes.clone())
         };
@@ -398,7 +489,20 @@ mod tests {
         );
 
         // An evicted object is a normal miss; it must not make the build fail.
-        storage.0.lock().unwrap().remove(&object_key);
+        let object_key = object_key.clone();
+        let object_prefix = object_key.trim_end_matches("/manifest.json").to_owned();
+        let keys = storage
+            .0
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if key == object_key || key.starts_with(&format!("{object_prefix}/")) {
+                storage.0.lock().unwrap().remove(&key);
+            }
+        }
         let evicted = tempfile::tempdir().unwrap();
         assert!(
             !restore(&storage, "namespace", "probe", evicted.path())
@@ -414,7 +518,7 @@ mod tests {
             .insert(object_key.clone(), object_bytes);
         let mut corrupted = CacheWrite::new();
         corrupted
-            .put_object(SNAPSHOT_ENTRY, &mut Cursor::new(b"truncated"), None)
+            .put_object(MANIFEST_ENTRY, &mut Cursor::new(b"{}"), None)
             .unwrap();
         storage
             .0
@@ -456,7 +560,7 @@ mod tests {
         let entries = storage.0.lock().unwrap();
         let object_count = entries
             .keys()
-            .filter(|key| key.contains("/objects/"))
+            .filter(|key| key.ends_with("/manifest.json"))
             .count();
         let index_bytes = entries.get(&index_key("namespace")).unwrap();
         let mut cache = CacheRead::from(Cursor::new(index_bytes.clone())).unwrap();
@@ -488,12 +592,7 @@ mod tests {
         archive.truncate(600);
         let object_id = blake3::hash(&archive).to_hex().to_string();
 
-        let mut object = CacheWrite::new();
-        object
-            .put_object(SNAPSHOT_ENTRY, &mut Cursor::new(archive), None)
-            .unwrap();
-        storage
-            .put(&object_key("namespace", &object_id), object)
+        store_snapshot_object(&storage, "namespace", &object_id, &archive)
             .await
             .unwrap();
         let mut index = CacheWrite::new();
