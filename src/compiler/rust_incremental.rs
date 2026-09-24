@@ -1,8 +1,10 @@
 use crate::cache::{Cache, CacheWrite, Storage};
 use anyhow::{Context, Result, anyhow};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 
 const SNAPSHOT_ENTRY: &str = "snapshot.tar";
 const INDEX_ENTRY: &str = "candidates.json";
@@ -30,6 +32,7 @@ pub(crate) async fn restore(
     let index: CandidateIndex =
         serde_json::from_slice(&index_bytes).context("invalid Rust incremental candidate index")?;
     for object_id in index.candidates.into_iter().take(MAX_CANDIDATES) {
+        let fetch_started = Instant::now();
         let Cache::Hit(mut cache) = storage.get(&object_key(namespace, &object_id)).await? else {
             continue;
         };
@@ -39,9 +42,19 @@ pub(crate) async fn restore(
         {
             continue;
         }
+        let fetch_elapsed = fetch_started.elapsed();
         std::fs::create_dir_all(directory).context("creating Rust incremental directory")?;
+        let unpack_started = Instant::now();
         match unpack_snapshot(&bytes, crate_name, directory) {
-            Ok(()) => return Ok(true),
+            Ok(()) => {
+                debug!(
+                    "restored Rust incremental snapshot: archive_bytes={} fetch_ms={} unpack_ms={}",
+                    bytes.len(),
+                    fetch_elapsed.as_secs_f64() * 1000.0,
+                    unpack_started.elapsed().as_secs_f64() * 1000.0
+                );
+                return Ok(true);
+            }
             Err(error) => {
                 let _ = discard_crate_state(directory, crate_name);
                 return Err(error);
@@ -58,12 +71,19 @@ pub(crate) async fn publish(
     directory: &Path,
 ) -> Result<()> {
     let archive = create_snapshot(crate_name, directory)?;
+    let archive_bytes = archive.len();
     let object_id = blake3::hash(&archive).to_hex().to_string();
     let mut entry = CacheWrite::new();
     entry.put_object(SNAPSHOT_ENTRY, &mut Cursor::new(archive), None)?;
+    let upload_started = Instant::now();
     storage
         .put(&object_key(namespace, &object_id), entry)
         .await?;
+    debug!(
+        "published Rust incremental snapshot: archive_bytes={} upload_ms={}",
+        archive_bytes,
+        upload_started.elapsed().as_secs_f64() * 1000.0
+    );
 
     let key = index_key(namespace);
     let mut candidates = match storage.get(&key).await? {

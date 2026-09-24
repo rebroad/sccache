@@ -215,6 +215,10 @@ compiled. This lets Cargo's build-script crate and package crates share the
 normal target incremental root without blocking one another's restore or
 overwriting sibling crate state. Extraction rejects entries outside that
 crate-specific directory and checks existing path components for symlinks.
+Debug logs record snapshot archive bytes, object fetch time, extraction time,
+and object upload time. With Redis, the cache-record payload size and total
+server-side network byte deltas can be measured separately from those raw
+archive bytes.
 
 The index key is `rust-incremental-v3/<namespace>/index`; its cache object
 `candidates.json` stores at most eight BLAKE3 archive ids, most recent first.
