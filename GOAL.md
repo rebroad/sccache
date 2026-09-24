@@ -46,6 +46,9 @@ Current additional test results on 2026-09-24:
   matched. The fresh-target test also proves Builder B starts without
   Builder A's target tree and reconstructs dependencies through ordinary exact
   sccache hits; this is allowed and expected by the goal.
+- Changed actual Cargo profile from dev to release with incremental mode
+  explicitly enabled: no predecessor restore, distinct namespace, and clean
+  release output matched.
 - Structured predecessor diagnostics now expose compiler-argument fingerprints,
   tracked environment-value digests, Cargo output identity exclusions, and
   dependency artifact logical names, paths, filenames, and byte digests. The

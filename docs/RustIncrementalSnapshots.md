@@ -12,6 +12,7 @@
 | Dependency identity diagnostics | PASS | `tests/rust-incremental-fresh-target.sh` (trace assertions for `OUT_DIR`, paths, filenames, and artifact digests) |
 | Sandbox build without daemon IPC | PASS | Fresh-target test with `SCCACHE_IN_PROCESS=1`; Redis container test with mode propagated to both builders |
 | Cargo feature-change namespace fallback | PASS | `tests/rust-incremental-fresh-target.sh` Builder D case |
+| Cargo profile-change namespace fallback | PASS | `tests/rust-incremental-fresh-target.sh` Builder E case (`--release`, incremental enabled) |
 | Immutable snapshot publication | PASS | `cargo test --lib rust_incremental::tests` |
 | Bounded candidate lookup | PASS | `candidate_index_retains_only_the_most_recent_bounded_set` |
 | Concurrent publishing | PASS | `tests/rust-incremental-sccache-poc.sh`; Redis race in `tests/rust-incremental-container-reuse.sh` |
@@ -41,8 +42,11 @@ Builder B build. A further build changes `CARGO_TARGET_DIR` and again proves
 predecessor loading and clean-output equivalence. A final build enables a real
 Cargo feature: it selects a distinct predecessor namespace, does not restore
 the incompatible no-feature snapshot, and matches a clean feature-enabled
-build. Builder B has an empty target at startup; restoring dependency artifacts
-through ordinary exact sccache hits is explicitly allowed and expected. The
+build. A final `--release` build with incremental mode enabled selects a
+distinct namespace from the dev predecessor, does not restore it, and matches
+a clean release build. Builder B has an empty target at startup; restoring
+dependency artifacts through ordinary exact sccache hits is explicitly allowed
+and expected. The
 test proves those hits materialize dependencies into Builder B's fresh target
 without inheriting Builder A's live target tree.
 
@@ -154,6 +158,7 @@ and `RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/
 | Case | Command/environment | Result |
 | --- | --- | --- |
 | Feature/cfg change | `SCCACHE_TEST_EXTRA_CFG=1 tests/rust-incremental-container-reuse.sh` | no predecessor restore; clean output matched |
+| Cargo profile change | Builder E in `tests/rust-incremental-fresh-target.sh` | dev predecessor rejected for incremental release profile; clean output matched |
 | Compiler flag change | `SCCACHE_TEST_EXTRA_RUSTFLAGS=1 tests/rust-incremental-container-reuse.sh` | no predecessor restore; clean output matched |
 | Target change | `SCCACHE_TEST_TARGET_TRIPLE=i686-unknown-linux-gnu tests/rust-incremental-container-reuse.sh` | no restore; clean i686 object verified |
 | rustc version mismatch | `SCCACHE_TEST_RUSTC_VERSION_MISMATCH=1 tests/rust-incremental-container-reuse.sh` | rustc 1.93 consumer did not restore rustc 1.98 state; clean output matched |

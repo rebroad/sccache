@@ -14,7 +14,7 @@ root=$(cd "$root" && pwd -P)
 cleanup() {
     local status=$?
     if [[ "$status" -ne 0 ]]; then
-        for log in "$root"/{a,b,c,d,clean,clean-c,clean-d}.log; do
+        for log in "$root"/{a,b,c,d,e,clean,clean-c,clean-d,clean-e}.log; do
             if [[ -f "$log" ]]; then
                 echo "--- $(basename "$log"): relevant diagnostics ---" >&2
                 rg 'predecessor namespace=|predecessor details:|compatibility inputs:|restored Rust incremental|no Rust incremental|Cache hit|files hard-linked|asserted that the incremental cache|completely ignoring cache|retrying without|error:|Finished' "$log" >&2 || true
@@ -54,6 +54,9 @@ generated_dependency = { path = "../../shared/generated_dependency" }
 snapshot_feature = []
 
 [profile.dev]
+incremental = true
+
+[profile.release]
 incremental = true
 
 [profile.dev.package.stable_dependency]
@@ -292,6 +295,37 @@ grep -q '^162 ' "$root/d.out"
 grep -F "$root/target-d/" "$root/d.out" >/dev/null
 grep -F "$root/target-clean-d/" "$root/clean-d.out" >/dev/null
 printf 'Cargo feature change selected a distinct namespace and matched a clean output: %s\n' "$namespace_d"
+
+# The release profile changes compiler options and must not restore dev-profile
+# state. Keep incremental mode enabled to check predecessor isolation directly.
+if [[ -e "$root/target-e" ]]; then
+    echo "Builder E target unexpectedly exists before its build" >&2
+    exit 1
+fi
+(
+    cd "$root/b/app"
+    SCCACHE_ASSERT_INCR_STATE=not-loaded "$cargo_bin" build --release \
+        --target-dir "$root/target-e" -vv > "$root/e.log" 2>&1
+)
+grep -F '[fresh_target_probe]: no Rust incremental snapshot' "$root/e.log" >/dev/null
+if grep -F '[fresh_target_probe]: restored Rust incremental snapshot' "$root/e.log" >/dev/null; then
+    echo "restored a dev-profile predecessor into the release-profile build" >&2
+    exit 1
+fi
+namespace_e=$(sed -n 's/.*\[fresh_target_probe\]: Rust incremental predecessor namespace=\([0-9a-f]*\).*/\1/p' "$root/e.log" | tail -1)
+[[ -n "$namespace_c" && -n "$namespace_e" && "$namespace_c" != "$namespace_e" ]]
+"$root/target-e/release/fresh_target_probe" > "$root/e.out"
+(
+    cd "$root/b/app"
+    RUSTC_WRAPPER= "$cargo_bin" build --release \
+        --target-dir "$root/target-clean-e" -vv > "$root/clean-e.log" 2>&1
+)
+"$root/target-clean-e/release/fresh_target_probe" > "$root/clean-e.out"
+[[ "$(cut -d ' ' -f 1 "$root/e.out")" == "$(cut -d ' ' -f 1 "$root/clean-e.out")" ]]
+grep -q '^62 ' "$root/e.out"
+grep -F "$root/target-e/" "$root/e.out" >/dev/null
+grep -F "$root/target-clean-e/" "$root/clean-e.out" >/dev/null
+printf 'Cargo release profile selected a distinct namespace and matched clean output: %s\n' "$namespace_e"
 
 printf 'Builder B exact dependency cache hit: '
 grep -F '[stable_dependency]: Cache hit' "$root/b.log" | head -1
