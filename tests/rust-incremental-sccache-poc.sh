@@ -24,6 +24,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+source_arg() {
+    local checkout=$1
+    if [[ ${SCCACHE_TEST_ABSOLUTE_INPUT:-0} == 1 ]]; then
+        printf '%s' "$root/$checkout/lib.rs"
+    else
+        printf 'lib.rs'
+    fi
+}
+
 printf 'rustc version:\n'
 "$rustc_bin" -Vv
 printf 'platform: '
@@ -55,7 +64,7 @@ compile_args=("$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
         -Z assert-incr-state=not-loaded -C incremental=incremental \
-        --out-dir out lib.rs 2> "$root/first.log"
+        --out-dir out "$(source_arg checkout-a)" 2> "$root/first.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
         "$(((elapsed_ns % 1000000000) / 1000000))" > "$root/first.seconds"
@@ -69,7 +78,7 @@ compile_args=("$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
         -Z assert-incr-state=loaded -C incremental=incremental \
-        --out-dir out lib.rs 2> "$root/same-checkout.log"
+        --out-dir out "$(source_arg checkout-a)" 2> "$root/same-checkout.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
         "$(((elapsed_ns % 1000000000) / 1000000))" > "$root/same-checkout.seconds"
@@ -90,7 +99,7 @@ fi
     start_ns=$(date +%s%N)
     "$sccache_bin" "${compile_args[@]}" \
         -Z assert-incr-state=loaded -C incremental=incremental \
-        --out-dir out lib.rs 2> "$root/second.log"
+        --out-dir out "$(source_arg checkout-b)" 2> "$root/second.log"
     elapsed_ns=$(($(date +%s%N) - start_ns))
     printf '%d.%03d\n' "$((elapsed_ns / 1000000000))" \
         "$(((elapsed_ns % 1000000000) / 1000000))" > "$root/second.seconds"
@@ -121,7 +130,7 @@ mkdir -p "$root/clean"
     cd "$root/checkout-b"
     RUSTC_BOOTSTRAP=1 "$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021 \
         --emit=metadata,link -Z remap-cwd-prefix=/sccache-workspace \
-        lib.rs --out-dir "$root/clean"
+        "$(source_arg checkout-b)" --out-dir "$root/clean"
 )
 RUSTC_BOOTSTRAP=1 "$rustc_bin" "$root/main.rs" --extern "snapshot_poc=$root/clean/libsnapshot_poc.rlib" \
     -o "$root/clean/check"
@@ -150,7 +159,7 @@ for builder in concurrent-a concurrent-b; do
         mkdir -p out
         "$sccache_bin" "${compile_args[@]}" \
             -Z assert-incr-state=not-loaded -C incremental=incremental \
-            --out-dir out lib.rs 2> "$root/$builder.log"
+            --out-dir out "$(source_arg "$builder")" 2> "$root/$builder.log"
     ) &
 done
 wait
@@ -160,7 +169,7 @@ wait
     mkdir -p out
     "$sccache_bin" "${compile_args[@]}" \
         -Z assert-incr-state=loaded -C incremental=incremental \
-        --out-dir out lib.rs 2> "$root/concurrent-reader.log"
+        --out-dir out "$(source_arg concurrent-reader)" 2> "$root/concurrent-reader.log"
 )
 grep -F 'restored Rust incremental snapshot' "$root/concurrent-reader.log" >/dev/null
 grep -Eq 'session directory: [1-9][0-9]* files hard-linked' "$root/concurrent-reader.log"

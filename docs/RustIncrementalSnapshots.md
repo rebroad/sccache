@@ -13,21 +13,27 @@
 | Real-workspace benchmark | FAIL |
 | Demonstrated performance improvement | INCONCLUSIVE |
 
-Same-checkout, different-checkout, reuse, and concurrent-publishing cases are
-demonstrated by `tests/rust-incremental-sccache-poc.sh` with rustc 1.98.1 on
-x86_64 Linux. The test proves rustc loaded state using
-`-Z assert-incr-state=loaded` and reports hard-linked work products. Cross-
+Same-checkout, different-checkout, and genuine-reuse PASS evidence:
+`tests/rust-incremental-sccache-poc.sh` (including its
+`SCCACHE_TEST_ABSOLUTE_INPUT=1` mode) with rustc 1.98.1 on x86_64 Linux. The
+test uses `-Z assert-incr-state=loaded` and reports hard-linked work products.
+Cargo's different-checkout PASS evidence, including `file!()` and
+`CARGO_MANIFEST_DIR`, is `tests/rust-incremental-cargo-poc.sh` with Cargo and
+rustc both pinned to 1.98.1. Cross-
 machine same-host-triple reuse is demonstrated by
 `tests/rust-incremental-container-reuse.sh`: separate container filesystems
 share only read-only toolchain/binary mounts and Redis. Container B reports
 five hard-linked work-product files, compares output with a clean build, and
 has an empty local cache directory. Full corruption fallback remains
-outstanding. Eviction
-fallback passes in `immutable_publication_restores_and_skips_evicted_or_corrupt_objects`
+outstanding. Eviction fallback passes in
+`immutable_publication_restores_and_skips_evicted_or_corrupt_objects`
 from `cargo test --lib rust_incremental::tests`: removing a referenced object
 returns a normal miss, and corrupt bytes under its immutable id are skipped
 without populating the private directory. A successful retry after rustc itself
 rejects a structurally valid but incompatible snapshot remains unverified.
+`truncated_snapshot_with_valid_object_id_is_rejected_cleanly` also verifies a
+truncated tar whose digest matches its published id is rejected and its private
+restore directory removed; the surrounding build retry remains unverified.
 Remote transfer passes with the repository's Redis backend: Redis contained
 incremental object and index keys, and the consumer's local cache stayed empty.
 Concurrent publishing passes the two-builder scenario
@@ -135,15 +141,24 @@ when a sandbox blocks local IPC: add `SCCACHE_IN_PROCESS=1` in that case.
 The checked-in test passes the input as relative `lib.rs` from each checkout's
 own working directory, then compares the program output against a clean build.
 This keeps the physical checkout roots different while rustc sees the same
-input argument; `file!()` returns `lib.rs` in both builds. An absolute-input
-container probe exposed a correctness failure: restored code returned
-`/sccache-workspace/lib.rs`, while a clean build returned a path containing
-the absolute checkout root. Absolute source-argument normalization therefore
-remains unresolved and is a key Cargo integration blocker. Other `file!()`
-forms, debug information, `CARGO_MANIFEST_DIR`, `OUT_DIR`, build-script output,
-proc-macro output, and path dependencies also need dedicated Cargo-workspace
-coverage. Rustc's incremental query validation must be allowed to invalidate
-path-sensitive queries; the remap flag is not a substitute for those checks.
+input argument; `file!()` returns `lib.rs` in both builds. The same harness also
+supports an absolute-input variant with
+`SCCACHE_TEST_ABSOLUTE_INPUT=1`. Both the restored and clean rustc invocations
+run from checkout B and receive the same absolute input. The separate-container
+Redis test passes in this mode as well: `file!()` returned
+`/sccache-workspace/lib.rs` for both restored and clean outputs, rustc accepted
+the snapshot, and the consumer reported five hard-linked work-product files.
+The earlier failure report compared different invocations (different input
+spelling and working directory) and was not evidence of an incremental-cache
+correctness defect. Absolute paths are not rewritten by sccache; rustc's path
+mapping and query validation preserve the current checkout's observable path.
+
+The Cargo test verifies that `CARGO_MANIFEST_DIR` and `file!()` match a clean
+build in checkout B after snapshot restore. Other `file!()` forms, debug
+information, `OUT_DIR`, build-script output, proc-macro output, and path
+dependencies still need dedicated tests. Rustc's incremental query validation
+must be allowed to invalidate path-sensitive queries; the remap flag is not a
+substitute for those checks.
 `-Z remap-cwd-prefix` can change the value observable by programs and users
 must account for that behavior.
 
@@ -183,7 +198,11 @@ Rustc's saved option hash is a necessary final check, not a sufficient sccache
 namespace: it does not promise to encode host CPU/OS compatibility or protect
 the snapshot transport. The current namespace includes rustc version, host
 triple, crate name, compiler options, environment dependencies, dependency
-digests, and the compiler shared-library identity. Target options are included.
+digests, and the compiler shared-library identity. `CARGO_MANIFEST_DIR` and
+`CARGO_MANIFEST_PATH` are omitted from the predecessor namespace because they
+name the physical checkout; they remain in the exact-output key. The Cargo
+integration test demonstrates rustc's path-sensitive values still match a clean
+build after a restored compile. Target options are included.
 The container test proves only the same x86_64 Linux host/target triple and
 toolchain; other host/target pairs remain unsupported.
 
@@ -192,9 +211,8 @@ source contents, so a revision change necessarily misses. A separate
 compatibility namespace plus immutable snapshot ids is implemented. The generic
 Storage API has key-based get/put but no compare-and-swap or listing. The
 bounded index tolerates last-writer wins by allowing an unreferenced immutable
-object to be orphaned; readers skip missing references. The namespace still
-needs a real Cargo-workspace audit, particularly for absolute source inputs and
-path-dependent environment values.
+object to be orphaned; readers skip missing references. Broader Cargo workspace
+coverage remains needed for build-script and path-dependency environment values.
 
 Approach B (new rustc export/import API) is not justified yet. Rustc already
 does the essential validation after a private copy. A compiler-owned snapshot
@@ -217,6 +235,21 @@ against a clean B build and verifies the `file!()` value. Run it with
 `SCCACHE_BIN=/path/to/sccache tests/rust-incremental-sccache-poc.sh`. It prints
 the exact `rustc -Vv` identity and platform. The script uses
 `RUSTC_BOOTSTRAP=1` to enable `-Z remap-cwd-prefix` and rustc's diagnostic flags.
+
+The Cargo cross-checkout regression must pin Cargo and rustc to the same
+toolchain (Cargo's executable path alone does not select rustc):
+
+```sh
+CARGO_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/cargo \
+RUSTC_BIN=/home/rebroad/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/bin/rustc \
+SCCACHE_BIN=/mnt/kingston/builds/rebroad/src/sccache.build/target/debug/sccache \
+tests/rust-incremental-cargo-poc.sh
+```
+
+It creates independent A and B checkouts and target directories, edits a Rust
+function, confirms sccache restored the predecessor and rustc hard-linked prior
+work products, then compares B's `file!()` and `CARGO_MANIFEST_DIR` program
+output with a clean B Cargo build.
 
 To combine the experimental snapshot path with a sandbox that denies local
 IPC, set both `SCCACHE_RUST_INCREMENTAL=1` and `SCCACHE_IN_PROCESS=1`. The

@@ -1663,6 +1663,11 @@ where
                     && !var.starts_with("CARGO_REGISTRIES_")
                     && var != "CARGO_BUILD_JOBS"
                     && var != "CARGO_ENCODED_RUSTFLAGS"
+                    // These identify the physical package checkout. Keep them
+                    // in the exact-output key above, but let rustc's incremental
+                    // environment tracking invalidate uses of them after restore.
+                    && var != "CARGO_MANIFEST_DIR"
+                    && var != "CARGO_MANIFEST_PATH"
                 {
                     var.hash(&mut HashToDigest {
                         digest: &mut snapshot,
@@ -1902,7 +1907,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // oversubscription sccache's own jobserver exists to prevent.
             share_jobserver: true,
         };
-
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
         #[cfg(feature = "dist-client")]

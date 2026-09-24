@@ -17,11 +17,15 @@ done
 printf 'pub fn source_path() -> &\x27static str { file!() }\n' >> "$root/lib.rs"
 sed -i 's/f64() -> u32 { 64 }/f64() -> u32 { 640 }/' "$root/lib.rs"
 cd "$root"
+input=lib.rs
+if [[ ${SCCACHE_TEST_ABSOLUTE_INPUT:-0} == 1 ]]; then
+    input="$root/lib.rs"
+fi
 mkdir -p out
 "$sccache_bin" "$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021 \
     --emit=metadata,link -Z incremental-info -C opt-level=0 \
     -Z remap-cwd-prefix=/sccache-workspace -Z assert-incr-state=loaded \
-    -C incremental=incremental --out-dir out lib.rs 2>/var/tmp/consumer.log
+    -C incremental=incremental --out-dir out "$input" 2>/var/tmp/consumer.log
 grep -F 'restored Rust incremental snapshot' /var/tmp/consumer.log
 grep -E 'session directory: [1-9][0-9]* files hard-linked' /var/tmp/consumer.log
 
@@ -38,7 +42,7 @@ RS
 mkdir -p /var/tmp/clean
 "$rustc_bin" --crate-name snapshot_poc --crate-type lib --edition=2021 \
     --emit=metadata,link -Z remap-cwd-prefix=/sccache-workspace \
-    lib.rs --out-dir /var/tmp/clean
+    "$input" --out-dir /var/tmp/clean
 "$rustc_bin" /var/tmp/main.rs --extern snapshot_poc=/var/tmp/clean/libsnapshot_poc.rlib \
     -o /var/tmp/clean-check
 /var/tmp/clean-check > /var/tmp/clean.out

@@ -289,4 +289,45 @@ mod tests {
         );
         assert!(std::fs::read_dir(rejected.path()).unwrap().next().is_none());
     }
+
+    #[tokio::test]
+    async fn truncated_snapshot_with_valid_object_id_is_rejected_cleanly() {
+        let storage = MemoryStorage::default();
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("state"), vec![b'x'; 4096]).unwrap();
+        let mut archive = create_snapshot(source.path()).unwrap();
+        archive.truncate(600);
+        let object_id = blake3::hash(&archive).to_hex().to_string();
+
+        let mut object = CacheWrite::new();
+        object
+            .put_object(SNAPSHOT_ENTRY, &mut Cursor::new(archive), None)
+            .unwrap();
+        storage
+            .put(&object_key("namespace", &object_id), object)
+            .await
+            .unwrap();
+        let mut index = CacheWrite::new();
+        index
+            .put_object(
+                INDEX_ENTRY,
+                &mut Cursor::new(
+                    serde_json::to_vec(&CandidateIndex {
+                        candidates: vec![object_id],
+                    })
+                    .unwrap(),
+                ),
+                None,
+            )
+            .unwrap();
+        storage.put(&index_key("namespace"), index).await.unwrap();
+
+        let private = tempfile::tempdir().unwrap();
+        assert!(
+            restore(&storage, "namespace", private.path())
+                .await
+                .is_err()
+        );
+        assert!(!private.path().exists());
+    }
 }

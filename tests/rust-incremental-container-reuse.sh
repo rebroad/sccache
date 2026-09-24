@@ -40,10 +40,14 @@ docker run --rm --network host \
     -v "$sccache_bin:/usr/local/bin/sccache:ro" \
     -v "$repo/tests/rust-incremental-sccache-poc.sh:/tmp/producer.sh:ro" \
     -e "SCCACHE_REDIS=$redis_url" -e SCCACHE_BIN=/usr/local/bin/sccache \
-    -e RUSTC_BIN=/toolchain/bin/rustc "$image" bash /tmp/producer.sh
+    -e RUSTC_BIN=/toolchain/bin/rustc \
+    -e SCCACHE_TEST_ABSOLUTE_INPUT="${SCCACHE_TEST_ABSOLUTE_INPUT:-0}" \
+    "$image" bash /tmp/producer.sh
 
 docker run --rm --network host \
     -v "$rustc_toolchain:/toolchain:ro" \
     -v "$sccache_bin:/usr/local/bin/sccache:ro" \
     -v "$repo/tests/rust-incremental-container-consumer.sh:/tmp/consumer.sh:ro" \
-    -e "SCCACHE_REDIS=$redis_url" "$image" bash /tmp/consumer.sh
+    -e "SCCACHE_REDIS=$redis_url" \
+    -e SCCACHE_TEST_ABSOLUTE_INPUT="${SCCACHE_TEST_ABSOLUTE_INPUT:-0}" \
+    "$image" bash /tmp/consumer.sh
