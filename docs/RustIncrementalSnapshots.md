@@ -582,6 +582,131 @@ The snapshot representation and transfer costs exceed the time saved here.
 This does not prove that every workspace or backend will regress, but the
 prototype must not claim a performance improvement based on these results.
 
+## Performance root-cause follow-up (2026-09-25)
+
+The earlier label “rustc compile elapsed ~91 s” was misleading. In the saved
+three-round logs, the benchmark's remote `rustc_compile_s` field sums sccache
+`Compiled in ...` durations across every cache miss in the Cargo build. It is
+not one rustc invocation and it is not directly comparable to the local
+case's sum of `-Z time-passes` records. For round 3 small-edit, the saved log
+has **54 Rust cache misses** with a summed compiler duration of **92.727 s**,
+alongside **1,081 exact-cache hits**. The largest individual misses include
+`sccache` (15.041 s), `redis` (11.049 s), `opendal_core` (5.101 s), `jiff`
+(4.555 s), and `reqwest` (3.784 s).
+
+For the edited `sccache` crate itself, the saved `-Z time-passes` records show
+about **12.5 s total** in rustc in the remote small-edit case; sccache reports
+15.041 s for that compile operation. The local incremental `sccache` crate
+records about **10.5 s** of rustc phase time. Thus the “91 s after snapshot
+restore” is not evidence that rustc spent 91 s validating or recomputing the
+restored crate. The observed dominant additional work is Cargo rebuilding
+dependencies whose ordinary exact keys miss in a fresh target build. Snapshot
+fetch and unpack remain only a few seconds.
+
+An exact-key example is `serde_core` in
+`r03-remote-incremental-miss.log` versus
+`r03-remote-incremental-small-edit.log`: source path, crate name, compiler
+options, Cargo metadata ID, and dependency artifact identity are otherwise
+the same, but `--out-dir` and `-L dependency` point under `remote-a/target`
+versus `remote-small/target`, and the exact hash changes from
+`a24a907858b535de...` to `149a47729febc198...`. The ordinary exact key remains
+path-sensitive for outputs/arguments where relocation could change output
+semantics. This is direct evidence that target-path differences can defeat
+exact artifact hits. It is not yet a controlled test proving that normalizing
+those paths makes the full workspace fast; some output bytes can also encode
+paths.
+
+### Path and rustc phase comparison
+
+| Configuration | Wall | rustc metric | Reused work products | Total work products | Status/evidence |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Local incremental, same checkout/target | 11.738 s median | `sccache` crate about 10.5 s rustc phase time; aggregate benchmark metric is not comparable | 268 files in rustc session diagnostics | Not recorded | Three-round workspace benchmark, `r03-local-incremental-small-edit.log` |
+| Restored snapshot, same logical source/target paths in separate filesystems | Not measured for workspace | Not measured for workspace | Five files in the small container POC | Not recorded | `tests/rust-incremental-container-reuse.sh` exercises a small POC; it does not time the workspace |
+| Restored snapshot, different source, normalized target | Not measured | Not measured | Not measured | Not recorded | No controlled case in the saved benchmark |
+| Restored snapshot, different source and target roots | 120.750 s median | 92.727 s summed across 54 cache-miss compiles; edited `sccache` crate about 12.5 s rustc phase time | 260 files for edited crate | Not recorded | Three-round workspace benchmark, `r03-remote-incremental-small-edit.log` |
+| Clean build, incremental disabled | 91.712 s in prior single-run benchmark | 313.243 s summed across rustc phase records | 0 | Not recorded | Prior baseline; not a paired sample in the repeated run |
+
+`-Z incremental-info` reports reused hard-linked files and query statistics,
+but the saved logs do not report the total number of work products in the
+snapshot or a reliable reused/available fraction. They also do not give a
+comparable total of reused versus invalidated codegen units. Therefore “260
+out of how many?” and the fraction of compiler work reused remain
+**unmeasured**; hard-link count alone cannot answer them. The existing logs do
+show nontrivial rustc work after restore: the edited crate's rustc time is
+near the local incremental time, rather than 7x higher.
+
+No controlled workspace self-profile or path-factorial experiment has yet
+measured B, C, or the combinations of identical/different source and target
+paths. Rustc time-passes data for the existing remote build shows the edited
+crate's own linking was not the 91-second component; individual crate links
+are in the subsecond range in the inspected rustc records. Query validation
+time and exact invalidation counts are not separately reported. Safe source
+and target path normalization has not been shown to change user-visible
+`file!()`, debug-info, or macro-path behavior for this full workspace.
+
+### Snapshot growth
+
+The saved benchmark establishes that the restored archive is about 365 MB and
+the next published archive about 730 MB. It does **not** preserve the archive
+file listing or incremental directory tree, so this run cannot establish the
+number or sizes of session directories, count the files/work products, or
+attribute the added bytes to particular files. Rustc's time-passes output
+shows its incremental session-GC phase ran, but that alone does not establish
+which session directories were retained or when they were removed relative
+to sccache snapshot capture. The cause of the approximately 365 MB growth and
+whether all captured sessions are needed are therefore **unresolved**. No
+files were removed.
+
+### Coarse-namespace false-positive and retry tests
+
+`tests/rust-incremental-false-positive.sh` builds `changed_dep::value()` as
+`1` in Builder A and `2` in Builder B while holding crate name, target,
+profile, features, rustc, and compiler options constant. It asserts the app
+predecessor namespace is identical, the candidate is restored, and
+`-Z assert-incr-state=loaded` succeeds. The restored executable prints `2 14`
+and matches a clean Builder B build. This proves correctness of the tested
+dependency-change case and confirms rustc/sccache discovery does not hash
+dependency artifact bytes into the predecessor namespace. The test does not
+yet assert exact red/green query counts, so the amount of invalidation is not
+quantified.
+
+The same script changes the app to contain an ordinary type error after a
+valid candidate has been published. Observed behavior: sccache restores the
+snapshot, rustc fails with the source error, and sccache invokes rustc a
+second time after discarding the restored state. The test observes exactly
+two `Compiling locally` attempts and returns failure. The current fallback
+therefore double-compiles ordinary source errors. Restricting retry to errors
+reasonably attributable to restored incremental state needs a reliable
+rustc diagnostic/API signal; no such policy change was made here.
+
+### Answers and remaining measurements
+
+1. The apparent ~91 s component is principally **dependency compilation after
+   exact-cache misses**, not 91 s of incremental-state validation. Snapshot
+   transport is smaller; the edited crate itself is about 12.5 s in the
+   inspected rustc phase log. The 92.727 s number is a sum across 54 compiles.
+2. Snapshot growth from ~365 MB to ~730 MB is **not yet explained at file or
+   session level**. The run discarded the directory inventories needed to do
+   that accounting.
+3. The reused fraction is **unknown**: 260 reused work products are observed,
+   but total available work products are not recorded.
+4. Target-root path differences demonstrably change at least some ordinary
+   exact keys (`serde_core` example above). Whether same logical paths
+   materially improve full-workspace reuse has not yet been measured.
+5. **Yes.** The false-positive dependency test restores the old candidate and
+   produces the new dependency's value, matching a clean build.
+6. **Yes.** An ordinary source type error is compiled twice under the current
+   unconditional retry-after-restored-failure behavior.
+7. The highest-leverage next measurement is to rerun the workspace with
+   identical logical source and target paths in independent filesystems, then
+   separate dependency exact-hit/miss time from the edited crate's rustc
+   phases. If that removes the 54 misses, path-stable builder layouts may
+   solve most of this measured regression without changing snapshot storage.
+
+The controlled same/different path matrix, full-workspace session inventory,
+self-profile, total-work-product counts, and query/codegen reuse fractions
+remain open investigation items; no storage optimization was attempted.
+
 ## Risks and remaining measurements
 
 - **Correctness:** always restore privately and trust rustc's compatibility
