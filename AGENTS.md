@@ -7,6 +7,16 @@ sure that when they do, the rules of the project are actually followed.
 If you are driving an agent here, you are responsible for its output. Read the
 diff before you send it.
 
+## Incremental snapshot dogfooding
+
+Before changing or using the experimental incremental-snapshot implementation,
+read `DOGFOOD-REPORT.md` for findings from the Codex repository and other
+dogfooding builds. Add concise, evidence-based results there after new
+dogfooding runs, including the project/revision, toolchain and relevant
+configuration, exact-cache and predecessor results, reuse evidence, timings,
+and failures or fallback to normal sccache. Keep observations distinct from
+verified correctness or performance conclusions.
+
 Answers to the reviewers should be done by a human, not an agent.
 
 ## 1. A PR needs tests
