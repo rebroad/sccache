@@ -638,8 +638,9 @@ near the local incremental time, rather than 7x higher.
 No controlled workspace self-profile or path-factorial experiment has yet
 measured B, C, or the combinations of identical/different source and target
 paths. Rustc time-passes data for the existing remote build shows the edited
-crate's own linking was not the 91-second component; individual crate links
-are in the subsecond range in the inspected rustc records. Query validation
+crate's main link phase at about **11.1 s**, compared with about **7.4 s** in
+the local incremental run. That roughly 3.7 s difference is material for the
+edited crate but is not the 91-second sum across 54 misses. Query validation
 time and exact invalidation counts are not separately reported. Safe source
 and target path normalization has not been shown to change user-visible
 `file!()`, debug-info, or macro-path behavior for this full workspace.
