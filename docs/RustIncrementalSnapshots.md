@@ -618,26 +618,55 @@ paths.
 
 ### Path and rustc phase comparison
 
+The matrix used Rust 1.98.1 (`48a229ceaefd4985c50990b14116b6d856af0985`),
+x86_64 Linux on an AMD Ryzen 7 4700U, Debian trixie containers with overlay2,
+and a shared disposable Redis service. Each Builder A/B had distinct source
+and target host directories, mounted at the logical `/workspace` or
+`/workspace-b` and `/target` or `/target-b` paths shown in the test. The
+containers shared neither source nor target trees; they shared only the
+read-only compiler/sccache mounts and Redis. Builder B began with an empty
+target. The four cases ran serially against one Redis index with edits 9–12,
+so later cases can choose the prior case's snapshot.
+
 | Configuration | Wall | rustc metric | Reused work products | Total work products | Status/evidence |
 | --- | ---: | ---: | ---: | ---: | --- |
 | Local incremental, same checkout/target | 11.738 s median | `sccache` crate about 10.5 s rustc phase time; aggregate benchmark metric is not comparable | 268 files in rustc session diagnostics | Not recorded | Three-round workspace benchmark, `r03-local-incremental-small-edit.log` |
-| Restored snapshot, same logical source/target paths in separate filesystems | Not measured for workspace | Not measured for workspace | Five files in the small container POC | Not recorded | `tests/rust-incremental-container-reuse.sh` exercises a small POC; it does not time the workspace |
-| Restored snapshot, different source, normalized target | Not measured | Not measured | Not measured | Not recorded | No controlled case in the saved benchmark |
-| Restored snapshot, different source and target roots | 120.750 s median | 92.727 s summed across 54 cache-miss compiles; edited `sccache` crate about 12.5 s rustc phase time | 260 files for edited crate | Not recorded | Three-round workspace benchmark, `r03-remote-incremental-small-edit.log` |
+| Restored snapshot, same logical source/target paths in separate containers | 74.397 s | `sccache` library rustc 2.999 s; sccache compile duration 5.481 s | 255/256 object files shared by inode between old/new sessions | 256 object files per session | `tests/rust-incremental-logical-path-matrix.sh`, `same-paths` |
+| Restored snapshot, different source root, same target root | 142.342 s | edited `sccache` library rustc 26.743 s, including 20.041 s codegen; sccache compile duration 34.751 s | 260 snapshot files hard-linked; per-case work-product use not counted | Not recorded | `source-diff`; same namespace and restored state, but predecessor age/edit differ from other cases |
+| Restored snapshot, same source root, different target root | 153.123 s | 316.060 aggregate sccache compile seconds over 337 exact misses; edited library rustc 12.132 s | 260 snapshot files hard-linked; per-case work-product use not counted | Not recorded | `target-diff`; zero exact hits because target/output paths changed |
+| Restored snapshot, different source and target roots | 92.203 s | edited library rustc 12.887 s; sccache compile duration 15.815 s | 260 snapshot files hard-linked; per-case work-product use not counted | Not recorded | `both-diff`; 336 exact hits, one miss |
 | Clean build, incremental disabled | 91.712 s in prior single-run benchmark | 313.243 s summed across rustc phase records | 0 | Not recorded | Prior baseline; not a paired sample in the repeated run |
 
-`-Z incremental-info` reports reused hard-linked files and query statistics,
-but the saved logs do not report the total number of work products in the
-snapshot or a reliable reused/available fraction. They also do not give a
-comparable total of reused versus invalidated codegen units. Therefore “260
-out of how many?” and the fraction of compiler work reused remain
-**unmeasured**; hard-link count alone cannot answer them. The existing logs do
-show nontrivial rustc work after restore: the edited crate's rustc time is
-near the local incremental time, rather than 7x higher.
+The workspace run reports 260 files restored into the incremental directory.
+Each `sccache` crate session contains 256 `.o` codegen work-product files plus
+four metadata/query-cache files. In the same-path successful edit, 255 of 256
+object paths have the same inode in the old and new sessions; one object was
+replaced. This is evidence that 255/256 available object files were carried
+into the updated session. It is not a query-count or total compiler-work
+fraction: `-Z incremental-info` does not report red/green query counts here.
 
-No controlled workspace self-profile or path-factorial experiment has yet
-measured B, C, or the combinations of identical/different source and target
-paths. Rustc time-passes data for the existing remote build shows the edited
+The path matrix is sequential, not four independent builds from one frozen
+candidate: it uses edit values 9, 10, 11, and 12 in turn and keeps a shared
+Redis index, so later cases can restore the immediately preceding case's
+snapshot. Treat the results as concrete path-sensitive observations rather
+than a fully controlled ranking. Identical logical paths let the exact cache
+hit 336 unchanged compiler requests. A different logical target path produced
+337 exact misses and 316.060 aggregate sccache compile seconds (153.123 s
+wall, with parallel compiler work), confirming that exact output reuse depends
+strongly on stable target paths. Changing only the logical source root still
+restored the candidate and hit 336 exact keys, but the edited library's
+measured codegen was 20.041 s versus no codegen phase in the same-path run.
+The current `-Z remap-cwd-prefix` setting therefore did not make source-root
+differences performance-neutral. The exact tracked input behind that change
+still needs a frozen-candidate `-Z self-profile` follow-up.
+
+The matrix covers the same/different source and target combinations, but it
+does not isolate them against one frozen predecessor: cases ran serially and
+could select a preceding case's publication. It therefore establishes that
+logical path changes affect exact-cache behavior and that rustc phase times
+varied, but cannot attribute the codegen difference to a specific path input.
+No workspace self-profile has yet identified that input. Rustc time-passes
+data for the existing remote build shows the edited
 crate's main link phase at about **11.1 s**, compared with about **7.4 s** in
 the local incremental run. That roughly 3.7 s difference is material for the
 edited crate but is not the 91-second sum across 54 misses. Query validation
@@ -647,16 +676,24 @@ and target path normalization has not been shown to change user-visible
 
 ### Snapshot growth
 
-The saved benchmark establishes that the restored archive is about 365 MB and
-the next published archive about 730 MB. It does **not** preserve the archive
-file listing or incremental directory tree, so this run cannot establish the
-number or sizes of session directories, count the files/work products, or
-attribute the added bytes to particular files. Rustc's time-passes output
-shows its incremental session-GC phase ran, but that alone does not establish
-which session directories were retained or when they were removed relative
-to sccache snapshot capture. The cause of the approximately 365 MB growth and
-whether all captured sessions are needed are therefore **unresolved**. No
-files were removed.
+The preserved same-path workspace run records 365,088,256 raw bytes in the
+producer archive and 723,198,464 bytes in the next publication. The crate's
+incremental directory contains two rustc session directories, each with 260
+files: 256 `.o` files plus one `.rmeta` and three `.bin` files. Their logical
+file sizes are 364,887,999 and 357,911,346 bytes. Across the two sessions, 255
+same-name object files share inodes (203,552,056 bytes of duplicate file
+content). On disk the crate directory uses 519,247,261 bytes, while the tar
+archive stores both paths as full files and grows to 723,198,464 bytes. The
+approximately 358 MB increase is the second session's ~358 MB of logical
+files; on disk, ~204 MB of those bytes share through hard links.
+
+After a third subsequent build attempt, rustc had created a third session and
+removed the oldest, leaving two. That attempt reached linking but failed
+because the minimal Debian container had no `cc`; it proves session rotation
+occurred before linking, not successful build correctness. Snapshots capture
+both sessions before a future build can rotate the old one out. No session was
+removed from a snapshot; whether pruning the older session from a published
+archive preserves all useful reuse still requires a correctness experiment.
 
 ### Coarse-namespace false-positive and retry tests
 
@@ -680,33 +717,95 @@ therefore double-compiles ordinary source errors. Restricting retry to errors
 reasonably attributable to restored incremental state needs a reliable
 rustc diagnostic/API signal; no such policy change was made here.
 
+### Side-by-side opt-in project checks
+
+The rebuilt fork is installed at
+`/home/rebroad/bin/sccache-incremental-prototype/sccache` (version 0.18.0,
+SHA-256 `348a2d33cbf4ad3be5b338ec74dc53a64747a757bccffec6e4ac3bd9e824f59a`).
+The system `/usr/bin/sccache` remains 0.10.0. The prototype is selected per
+build through `RUSTC_WRAPPER` with `SCCACHE_RUST_INCREMENTAL=1`; the probe also
+uses `SCCACHE_IN_PROCESS=1`. No PATH, system binary, or global sccache setting
+was changed.
+
+`tests/rust-incremental-real-projects.sh` copies each source workspace to a
+disposable `/var/tmp` checkout, seeds Redis with a real build, changes one
+Rust source comment, clears the target directory, and rebuilds. The unchanged
+dependencies return as ordinary exact hits; the edited crate is an exact miss
+and restores an incremental predecessor.
+
+| Project/package | Seed wall | Edit wall | sccache compile time | Exact hits / misses | Predecessor | Reused files | Raw snapshot restored → published |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sccache workspace, `sccache` | 167.492 s | 74.397 s | 5.481 s | 336 / 1 | 1 | 260 | 365,088,256 → 723,198,464 B |
+| zeroclaw, `zeroclaw-api` | 16.678 s | 8.412 s | 0.370 s | 27 / 1 | 1 | 115 | 15,076,352 → 29,936,128 B |
+| Codex, `codex-utils-absolute-path` | 18.443 s | 7.919 s | 0.169 s | 21 / 1 | 1 | 48 | 3,742,208 → 7,448,064 B |
+
+The first row is the same-path Docker matrix. The other two rows came from
+`tests/rust-incremental-real-projects.sh` using the installed sidecar and
+`TMPDIR=/var/tmp`. The
+Codex copy failed Cargo's `--locked` consistency check before compilation, so
+that isolated probe was rerun without `--locked`; its temporary copy's lock
+file could change, while the original checkout remained untouched. These
+checks prove builds completed after predecessor restoration. They do not
+include a clean-output comparison for each project, and the compile duration
+is sccache's metric, not rustc-only CPU time. Full logs and toolchain data are
+under `/mnt/kingston/builds/rebroad/src/sccache.build/real-project-probes/20260925T130123Z`.
+
 ### Answers and remaining measurements
 
-1. The apparent ~91 s component is principally **dependency compilation after
-   exact-cache misses**, not 91 s of incremental-state validation. Snapshot
-   transport is smaller; the edited crate itself is about 12.5 s in the
-   inspected rustc phase log. The 92.727 s number is a sum across 54 compiles.
-2. Snapshot growth from ~365 MB to ~730 MB is **not yet explained at file or
-   session level**. The run discarded the directory inventories needed to do
-   that accounting.
-3. The reused fraction is **unknown**: 260 reused work products are observed,
-   but total available work products are not recorded.
-4. Target-root path differences demonstrably change at least some ordinary
-   exact keys (`serde_core` example above). Whether same logical paths
-   materially improve full-workspace reuse has not yet been measured.
+1. The earlier ~91 s is aggregate compilation across exact-cache misses. In
+   this path matrix, changing the target root caused 337 exact misses; changing
+   only source root retained 336 exact hits, but the edited crate spent 20 s
+   in codegen. Snapshot transport and publication are separately visible and
+   do not explain all rustc phase differences.
+2. The ~365 to ~723 MB growth is explained by a second 358 MB rustc session
+   being added while the previous session remains. The tar archive expands
+   shared hard-linked object files into full duplicate entries.
+3. The same-path update has 256 object work products available and 255 object
+   paths shared by inode between old and new sessions. Query-level reuse and
+   total compiler-work fraction remain unmeasured.
+4. Stable target paths materially improve ordinary exact hits. The same-path
+   run had 336; the different-target run had zero. Current source remapping
+   preserves predecessor discovery and exact hits but does not make rustc
+   codegen performance equivalent in the observed sequence.
 5. **Yes.** The false-positive dependency test restores the old candidate and
    produces the new dependency's value, matching a clean build.
 6. **Yes.** An ordinary source type error is compiled twice under the current
    unconditional retry-after-restored-failure behavior.
-7. The highest-leverage next measurement is to rerun the workspace with
-   identical logical source and target paths in independent filesystems, then
-   separate dependency exact-hit/miss time from the edited crate's rustc
-   phases. If that removes the 54 misses, path-stable builder layouts may
-   solve most of this measured regression without changing snapshot storage.
+7. The next highest-value measurement is a frozen-candidate self-profile for
+   same versus different source roots, followed by a controlled comparison of
+   binary-target incremental state across paths. Stable target roots are already
+   a demonstrated practical requirement for ordinary exact dependency hits.
 
-The controlled same/different path matrix, full-workspace session inventory,
-self-profile, total-work-product counts, and query/codegen reuse fractions
-remain open investigation items; no storage optimization was attempted.
+Query-level red/green counts, a frozen-candidate self-profile, and whether the
+older of two captured sessions can safely be omitted remain open. No storage
+optimization or global sccache replacement was attempted.
+
+### Deployment decision from current evidence
+
+- **Stable logical target roots:** required for good ordinary exact-cache hit
+  rates in this workspace. The different-target case had 337 misses versus
+  336 hits with the stable target path. This is a measured layout requirement,
+  not proof that the same layout works for every Cargo project.
+- **Stable logical source roots:** likely beneficial to rustc reuse, but not
+  yet a deployment requirement proven by a frozen-candidate comparison. The
+  sequential source-diff case spent 20.041 s in codegen, while the same-path
+  case spent none; it is suggestive but confounded by predecessor age/edit.
+- **Snapshot deduplication:** likely needed before broad deployment. Each small
+  edit publishes a second ~358 MB logical session, and archives store repeated
+  hard-linked object bytes independently. Redis compression reduces transfer,
+  but does not remove the duplicated raw object data or dataset growth. No
+  deduplication was implemented in this investigation.
+- **Rustc cooperation:** not established as required yet. Rustc accepted the
+  restored state and reused 255/256 object work products for the same-path
+  library edit. Cross-source-path query/codegen behavior is still unresolved;
+  obtain a frozen-candidate self-profile before deciding whether path
+  normalization is sufficient or compiler changes are needed.
+- **Side-by-side deployment:** the opt-in fork built two additional real
+  projects after predecessor restoration, but these probes do not prove
+  clean-build output equivalence for each project or a net performance gain.
+  Keep the feature opt-in and the normal sccache installation unchanged.
+  Global replacement is not justified by the present correctness and
+  performance evidence.
 
 ## Risks and remaining measurements
 
@@ -762,6 +861,8 @@ review.
 - `tests/rust-incremental-fresh-target.sh`
 - `tests/rust-incremental-workspace-benchmark.sh`
 - `tests/rust-incremental-path-sensitive.sh`
+- `tests/rust-incremental-logical-path-matrix.sh`
+- `tests/rust-incremental-real-projects.sh`
 - `docs/RustIncrementalSnapshots.md`
 - `docs/Rust.md`
 - `docs/Configuration.md`
