@@ -1,0 +1,71 @@
+name: Rebase incremental snapshots onto upstream sccache v0.19.0
+
+on:
+  push:
+    branches: [rebase-v0.19.0-builder]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out build orchestration branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Replay exactly 23 ReBroad commits onto upstream release
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'ReBroad Rebase Bot'
+          git config user.email 'rebroad-rebase@users.noreply.github.com'
+          git remote add upstream https://github.com/mozilla/sccache.git
+          git fetch --no-tags upstream 'refs/tags/v0.19.0:refs/tags/upstream-v0.19.0'
+          tag_commit=$(git rev-parse 'upstream-v0.19.0^{}')
+          [[ "$tag_commit" == '965c01943a40c9df96264474bbe28ba98f2e1487' ]] || {
+            echo "::error::Upstream stable v0.19.0 unexpectedly changed."
+            exit 1
+          }
+          git checkout -B replay-source 1570d050233a77718c24ba0e27d702760adc01f4
+          echo "Rebasing 23 ReBroad commits onto upstream v0.19.0"
+          echo 'Conflict policy: retain ReBroad changes only when both sides edit the exact same hunk.'
+          git rebase --no-autosquash --strategy=ort -X theirs "$tag_commit"
+          [[ $(git rev-list --count "$tag_commit"..HEAD) -eq 23 ]]
+          test "$(git merge-base HEAD "$tag_commit")" = "$tag_commit"
+          echo "Rebased head: $(git rev-parse HEAD)"
+          git log --oneline "$tag_commit"..HEAD
+          git diff --check "$tag_commit"..HEAD
+
+      - name: Set up recent Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91.0'
+          components: rustfmt
+
+      - name: Verify Rust formatting on rebased code
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: Compile rebased project with locked dependencies
+        shell: bash
+        run: cargo check --locked --all-targets
+
+      - name: Upload the verified linear rebase to staging branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='rebase-v0.19.0-incremental-snapshots'
+          old_sha=$(git ls-remote origin "refs/heads/$target" | awk '{print $1}')
+          [[ "$old_sha" == '965c01943a40c9df96264474bbe28ba98f2e1487' ]] || {
+            echo "::error::Unexpected staging branch head; refusing to overwrite."
+            exit 1
+          }
+          git push origin "HEAD:refs/heads/$target"
+          echo "Validated rebase is now on $target"
