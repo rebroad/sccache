@@ -4493,6 +4493,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 output_dir: "out".into(),
                 externs: vec![],
                 crate_link_paths: vec![],
+                input: "foo.rs".into(),
+                incremental: None,
                 staticlibs: vec![],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {
