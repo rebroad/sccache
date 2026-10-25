@@ -802,6 +802,7 @@ pub fn do_compile_in_process<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
     storage: Arc<dyn Storage>,
+    cache_mode: CacheMode,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -820,6 +821,7 @@ where
     let service = server::SccacheService::<C>::new(
         server::DistClientContainer::new_disabled(),
         storage,
+        cache_mode,
         jobserver,
         runtime.handle().clone(),
         tx,
@@ -831,12 +833,14 @@ where
         args: cmdline.clone(),
         env_vars,
     };
-    let (compile_resp, finished) = runtime.block_on(service.compile_direct(compile))?;
+    let (compile_resp, finished, forwarded_notification) =
+        runtime.block_on(service.compile_direct(compile, stderr))?;
     handle_compile_result(
         C::new(jobserver),
         runtime,
         compile_resp,
         finished,
+        forwarded_notification,
         &exe_path,
         cmdline,
         cwd,
@@ -1064,6 +1068,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &jobserver,
                     &mut runtime,
                     storage,
+                    cache_mode,
                     exe.as_ref(),
                     cmdline,
                     &cwd,
