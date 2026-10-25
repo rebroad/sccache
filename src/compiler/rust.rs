@@ -16,8 +16,8 @@ use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::{
     CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, Compiler,
-    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
-    SingleCompileCommand, c::ArtifactDescriptor,
+    CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, IncrementalState,
+    Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
@@ -40,7 +40,7 @@ use std::borrow::Borrow;
 use std::borrow::Cow;
 #[cfg(feature = "dist-client")]
 use std::collections::hash_map::RandomState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env::consts::DLL_EXTENSION;
 #[cfg(feature = "dist-client")]
 use std::env::consts::{DLL_PREFIX, EXE_EXTENSION};
@@ -345,6 +345,8 @@ pub struct ParsedArguments {
     externs: Vec<PathBuf>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
+    input: OsString,
+    incremental: Option<PathBuf>,
     /// Static libraries linked to in the compile.
     staticlibs: Vec<PathBuf>,
     /// The crate name passed to --crate-name.
@@ -407,6 +409,7 @@ pub struct RustCompilation {
     outputs: HashMap<String, ArtifactDescriptor>,
     /// The directories searched for rlibs
     crate_link_paths: Vec<PathBuf>,
+    incremental: Option<IncrementalState>,
     /// The crate name being compiled.
     crate_name: String,
     /// The crate types that will be generated
@@ -790,9 +793,12 @@ where
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
+        let incremental_enabled = env_vars
+            .iter()
+            .any(|(key, value)| key == "SCCACHE_RUST_INCREMENTAL" && value == "1");
+        match parse_arguments_with_incremental(arguments, cwd, incremental_enabled) {
             CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
                 executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                 host: self.host.clone(),
@@ -1278,6 +1284,72 @@ ArgData! {
 
 use self::ArgData::*;
 
+/// Explain why an argument is omitted from the incremental predecessor key.
+/// These values identify a particular Cargo output location or artifact, not
+/// the compiler configuration that rustc can reuse work under.
+fn incremental_argument_skip_reason(
+    argument: &Argument<ArgData>,
+    input: &OsString,
+    target_json: bool,
+) -> Option<&'static str> {
+    match argument.get_data() {
+        Some(Emit(_)) => Some("emit-kind"),
+        Some(OutDir(_)) => Some("output-directory"),
+        Some(Extern(_)) => Some("extern-path"),
+        Some(LinkPath(_)) => Some("link-search-path"),
+        Some(Target(_)) if target_json => Some("target-json-path"),
+        Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental" => {
+            Some("incremental-directory")
+        }
+        Some(CodeGen(ArgCodegen { opt, .. })) if opt == "metadata" => {
+            Some("cargo-metadata-identity")
+        }
+        Some(CodeGen(ArgCodegen { opt, .. })) if opt == "extra-filename" => {
+            Some("cargo-extra-filename")
+        }
+        Some(Unstable(ArgUnstable { opt, .. })) if opt == "assert-incr-state" => {
+            Some("incremental-test-assertion")
+        }
+        _ if argument.to_os_string() == *input => Some("source-input"),
+        _ => None,
+    }
+}
+
+fn hash_incremental_arguments(
+    arguments: &[Argument<ArgData>],
+    input: &OsString,
+    target_json: bool,
+    digest: &mut Digest,
+) -> BTreeMap<&'static str, usize> {
+    let mut skipped = BTreeMap::new();
+    for argument in arguments {
+        if let Some(reason) = incremental_argument_skip_reason(argument, input, target_json) {
+            *skipped.entry(reason).or_insert(0) += 1;
+        } else {
+            argument.to_os_string().hash(&mut HashToDigest { digest });
+            if let Some(value) = argument.get_data() {
+                value
+                    .clone()
+                    .into_arg_os_string()
+                    .hash(&mut HashToDigest { digest });
+            }
+        }
+    }
+    skipped
+}
+
+fn incremental_environment_skip_reason(name: &str) -> Option<&'static str> {
+    match name {
+        "CARGO_MAKEFLAGS" => Some("jobserver-state"),
+        "CARGO_BUILD_JOBS" => Some("build-parallelism"),
+        "CARGO_ENCODED_RUSTFLAGS" => Some("rustflags-already-in-arguments"),
+        "CARGO_TARGET_DIR" => Some("physical-target-directory"),
+        "CARGO_MANIFEST_DIR" | "CARGO_MANIFEST_PATH" => Some("physical-package-location"),
+        _ if name.starts_with("CARGO_REGISTRIES_") => Some("registry-credential-or-override"),
+        _ => None,
+    }
+}
+
 use super::CacheControl;
 
 // These are taken from https://github.com/rust-lang/rust/blob/b671c32ddc8c36d50866428d83b7716233356721/src/librustc/session/config.rs#L1186
@@ -1376,7 +1448,16 @@ impl Iterator for ExpandResponseFile<'_> {
     }
 }
 
+#[cfg(test)]
 fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+    parse_arguments_with_incremental(arguments, cwd, false)
+}
+
+fn parse_arguments_with_incremental(
+    arguments: &[OsString],
+    cwd: &Path,
+    incremental_enabled: bool,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1397,6 +1478,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut profile = None;
     let mut gcno = false;
     let mut target_json = None;
+    let mut incremental = None;
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
@@ -1452,23 +1534,16 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(CrateName(value)) => crate_name = Some(value.clone()),
             Some(OutDir(value)) => output_dir = Some(value.clone()),
             Some(Extern(ArgExtern { path, .. })) => externs.push(path.clone()),
-            Some(CodeGen(ArgCodegen { opt, value })) => {
-                match (opt.as_ref(), value) {
-                    ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
-                    ("extra-filename", None) => cannot_cache!("extra-filename"),
-                    ("profile-use", Some(v)) => profile = Some(v.clone()),
-                    // Incremental compilation makes a mess of sccache's entire world
-                    // view. It produces additional compiler outputs that we don't cache,
-                    // and just letting rustc do its work in incremental mode is likely
-                    // to be faster than trying to fetch a result from cache anyway, so
-                    // don't bother caching compiles where it's enabled currently.
-                    // Longer-term we would like to figure out better integration between
-                    // sccache and rustc in the incremental scenario:
-                    // https://github.com/mozilla/sccache/issues/236
-                    ("incremental", _) => cannot_cache!("incremental"),
-                    (_, _) => (),
+            Some(CodeGen(ArgCodegen { opt, value })) => match (opt.as_ref(), value) {
+                ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
+                ("extra-filename", None) => cannot_cache!("extra-filename"),
+                ("profile-use", Some(v)) => profile = Some(v.clone()),
+                ("incremental", Some(path)) if incremental_enabled => {
+                    incremental = Some(cwd.join(path));
                 }
-            }
+                ("incremental", _) => cannot_cache!("incremental"),
+                (_, _) => (),
+            },
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
                 Some("y") | Some("yes") | Some("on") | None if opt == "profile" => {
                     gcno = true;
@@ -1538,7 +1613,7 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     }
     // We don't actually save the input value, but there needs to be one.
     req!(input);
-    drop(input);
+    let _ = input;
     req!(output_dir);
     req!(emit);
     req!(crate_name);
@@ -1622,6 +1697,8 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         crate_types,
         externs,
         crate_link_paths,
+        input,
+        incremental,
         staticlibs,
         crate_name,
         dep_info: dep_info.map(|s| s.into()),
@@ -1679,7 +1756,11 @@ where
         let filtered_arguments = os_string_arguments
             .iter()
             .filter_map(|(arg, val)| {
-                if arg == "--emit" || arg == "--out-dir" {
+                let is_incremental = matches!(arg.to_str(), Some("-C" | "--codegen"))
+                    && val
+                        .as_ref()
+                        .is_some_and(|value| value.to_string_lossy().starts_with("incremental="));
+                if arg == "--emit" || arg == "--out-dir" || is_incremental {
                     None
                 } else {
                     Some((arg, val))
@@ -1706,15 +1787,21 @@ where
         };
 
         // Turn arguments into a simple Vec<OsString> to calculate outputs.
-        let flat_os_string_arguments: Vec<OsString> = os_string_arguments
+        let output_name_arguments: Vec<OsString> = os_string_arguments
             .iter()
+            .filter(|(arg, val)| {
+                !(matches!(arg.to_str(), Some("-C" | "--codegen"))
+                    && val
+                        .as_ref()
+                        .is_some_and(|value| value.to_string_lossy().starts_with("incremental=")))
+            })
             .cloned()
             .flat_map(|(arg, val)| iter::once(arg).chain(val))
             .collect();
         let outputs = get_compiler_outputs(
             creator,
             &self.executable,
-            flat_os_string_arguments,
+            output_name_arguments,
             &cwd,
             &env_vars,
         );
@@ -1829,10 +1916,10 @@ where
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
         // 7. The digest of the content of the target json file specified via `--target` (if any).
         for h in source_hashes
-            .into_iter()
-            .chain(extern_hashes)
-            .chain(staticlib_hashes)
-            .chain(target_json_hash)
+            .iter()
+            .chain(&extern_hashes)
+            .chain(&staticlib_hashes)
+            .chain(&target_json_hash)
         {
             m.update(h.as_bytes());
         }
@@ -1876,6 +1963,228 @@ where
             m.update(b"=");
             val.hash(&mut HashToDigest { digest: &mut m });
         }
+        let incremental_cache_key = self.parsed_args.incremental.as_ref().map(|_| {
+            let mut snapshot = Digest::new();
+            snapshot.update(b"sccache-rust-incremental-snapshot-v4");
+            snapshot.update(CACHE_VERSION);
+            self.host.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            self.version.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            self.parsed_args.crate_name.hash(&mut HashToDigest {
+                digest: &mut snapshot,
+            });
+            for digest in &self.compiler_shlibs_digests {
+                snapshot.update(digest.as_bytes());
+            }
+            let skipped_argument_reasons = hash_incremental_arguments(
+                &self.parsed_args.arguments,
+                &self.parsed_args.input,
+                self.parsed_args.target_json.is_some(),
+                &mut snapshot,
+            );
+            // Keep dependency names as a useful compatibility signal, but do
+            // not key predecessor discovery on the current .rlib/.rmeta
+            // bytes. Fresh Cargo target roots can produce different artifact
+            // bytes (for example when build scripts embed target-specific
+            // OUT_DIR values). rustc tracks dependency fingerprints in the
+            // restored incremental graph and remains the authority on reuse.
+            let mut extern_names = self
+                .parsed_args
+                .arguments
+                .iter()
+                .filter_map(|argument| match argument.get_data() {
+                    Some(Extern(extern_arg)) => {
+                        Some(extern_arg.name.split(':').next().unwrap_or_default().to_owned())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            extern_names.sort();
+            extern_names.dedup();
+            for name in &extern_names {
+                name.hash(&mut HashToDigest {
+                    digest: &mut snapshot,
+                });
+            }
+            let cargo_output_ids = self
+                .parsed_args
+                .arguments
+                .iter()
+                .filter_map(|argument| match argument.get_data() {
+                    Some(CodeGen(ArgCodegen { opt, value }))
+                        if opt == "metadata" || opt == "extra-filename" =>
+                    {
+                        Some(format!("{opt}={}", value.as_deref().unwrap_or("")))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let target_arguments = self
+                .parsed_args
+                .arguments
+                .iter()
+                .filter_map(|argument| match argument.get_data() {
+                    Some(Target(target)) => Some(
+                        target
+                            .clone()
+                            .into_arg_os_string()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let physical_cargo_env = env_vars
+                .iter()
+                .filter_map(|(var, val)| {
+                    let var_name = var.to_string_lossy();
+                    (incremental_environment_skip_reason(&var_name)
+                        == Some("physical-target-directory")
+                        || incremental_environment_skip_reason(&var_name)
+                            == Some("physical-package-location"))
+                    .then(|| format!("{var_name}={}", val.to_string_lossy()))
+                })
+                .collect::<Vec<_>>();
+            let package_configuration_env = env_vars
+                .iter()
+                .filter_map(|(var, val)| {
+                    let var_name = var.to_string_lossy();
+                    (var_name.starts_with("CARGO_PKG_")
+                        || var_name.starts_with("CARGO_FEATURE_")
+                        || var_name.starts_with("CARGO_CFG_"))
+                    .then(|| format!("{var_name}={}", val.to_string_lossy()))
+                })
+                .collect::<Vec<_>>();
+            for digest in staticlib_hashes.iter().chain(&target_json_hash) {
+                snapshot.update(digest.as_bytes());
+            }
+            // Dep-info environment dependencies come from rustc's tracked
+            // env!()/option_env!() reads. Keep them in the exact-output key
+            // above, but let rustc validate and invalidate affected queries
+            // after restoring a predecessor. Hashing their values here
+            // would prevent reuse whenever Cargo changes a physical value
+            // such as OUT_DIR or a build-script export derived from it.
+            let mut skipped_cargo_env = BTreeMap::new();
+            for (var, val) in &env_vars {
+                let var_name = var.to_string_lossy();
+                if !var_name.starts_with("CARGO_") {
+                    continue;
+                }
+                if let Some(reason) = incremental_environment_skip_reason(&var_name) {
+                    skipped_cargo_env.insert(var_name.into_owned(), reason);
+                    continue;
+                }
+                var.hash(&mut HashToDigest {
+                    digest: &mut snapshot,
+                });
+                snapshot.update(b"=");
+                val.hash(&mut HashToDigest {
+                    digest: &mut snapshot,
+                });
+            }
+            let namespace = snapshot.finish();
+            let argument_fingerprints = self
+                .parsed_args
+                .arguments
+                .iter()
+                .enumerate()
+                .map(|(index, argument)| {
+                    let label = match argument.get_data() {
+                        Some(CodeGen(arg)) => format!("-C {}", arg.opt),
+                        Some(Unstable(arg)) => format!("-Z {}", arg.opt),
+                        Some(Extern(_)) => "--extern".to_owned(),
+                        Some(OutDir(_)) => "--out-dir".to_owned(),
+                        Some(Target(_)) => "--target".to_owned(),
+                        Some(Emit(_)) => "--emit".to_owned(),
+                        Some(LinkPath(_)) => "-L".to_owned(),
+                        Some(CrateName(_)) => "--crate-name".to_owned(),
+                        Some(CrateType(_)) => "--crate-type".to_owned(),
+                        _ => format!("argument#{index}"),
+                    };
+                    if let Some(reason) = incremental_argument_skip_reason(
+                        argument,
+                        &self.parsed_args.input,
+                        self.parsed_args.target_json.is_some(),
+                    ) {
+                        return format!("{label}:skipped:{reason}");
+                    }
+                    let mut fingerprint = Digest::new();
+                    argument
+                        .to_os_string()
+                        .hash(&mut HashToDigest {
+                            digest: &mut fingerprint,
+                        });
+                    if let Some(value) = argument.get_data() {
+                        value
+                            .clone()
+                            .into_arg_os_string()
+                            .hash(&mut HashToDigest {
+                                digest: &mut fingerprint,
+                            });
+                    }
+                    format!("{label}:included:{}", fingerprint.finish())
+                })
+                .collect::<Vec<_>>();
+            let tracked_env_fingerprints = env_deps
+                .iter()
+                .map(|(name, value)| {
+                    let mut fingerprint = Digest::new();
+                    value.hash(&mut HashToDigest {
+                        digest: &mut fingerprint,
+                    });
+                    format!("{}:{}", name.to_string_lossy(), fingerprint.finish())
+                })
+                .collect::<Vec<_>>();
+            debug!(
+                "[{}]: Rust incremental predecessor namespace={} rustc_version={} rustc_host={} target_args={:?} extern_names={:?} extern_artifacts={} (artifact digests omitted from predecessor identity) skipped_arguments={:?} skipped_cargo_env={:?}",
+                self.parsed_args.crate_name,
+                namespace,
+                self.version.lines().next().unwrap_or(&self.version),
+                self.host,
+                target_arguments,
+                extern_names,
+                abs_externs.len(),
+                skipped_argument_reasons,
+                skipped_cargo_env,
+            );
+            trace!(
+                "[{}]: Rust incremental predecessor details: cargo_output_ids_excluded={:?}; physical_cargo_env_excluded={:?}; package_configuration_env_included={:?}; dependency_artifacts={:?}",
+                self.parsed_args.crate_name,
+                cargo_output_ids,
+                physical_cargo_env,
+                package_configuration_env,
+                abs_externs
+                    .iter()
+                    .zip(&extern_hashes)
+                    .map(|(path, digest)| format!(
+                        "logical_name={} path={} filename={} byte_digest={} digest_in_namespace=false",
+                        self.parsed_args
+                            .arguments
+                            .iter()
+                            .find_map(|argument| match argument.get_data() {
+                                Some(Extern(extern_arg)) if cwd.join(&extern_arg.path) == *path => {
+                                    Some(extern_arg.name.split(':').next().unwrap_or_default())
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or("unknown"),
+                        path.display(),
+                        path.file_name().unwrap_or_default().to_string_lossy(),
+                        digest
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            trace!(
+                "[{}]: Rust incremental compatibility inputs: rustc_arguments={:?}; tracked_environment_value_digests={:?}",
+                self.parsed_args.crate_name,
+                argument_fingerprints,
+                tracked_env_fingerprints,
+            );
+            namespace
+        });
         // 9. The cwd of the compile. This will wind up in the rlib.
         cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
@@ -2021,6 +2330,15 @@ where
                 inputs,
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
+                incremental: incremental_cache_key.map(|cache_key| IncrementalState {
+                    directory: self
+                        .parsed_args
+                        .incremental
+                        .clone()
+                        .expect("incremental key without directory"),
+                    cache_key: format!("rust-incr-{cache_key}"),
+                    crate_name: self.parsed_args.crate_name.clone(),
+                }),
                 crate_name: self.parsed_args.crate_name.clone(),
                 crate_types: self.parsed_args.crate_types.clone(),
                 cwd,
@@ -2050,6 +2368,10 @@ where
 }
 
 impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
+    fn box_clone(&self) -> Box<dyn Compilation<T>> {
+        Box::new(self.clone())
+    }
+
     fn generate_compile_commands(
         &self,
         path_transformer: &mut dist::PathTransformer,
@@ -2094,7 +2416,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             // oversubscription sccache's own jobserver exists to prevent.
             share_jobserver: true,
         };
-
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
         #[cfg(feature = "dist-client")]
@@ -2246,6 +2567,10 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             path: v.path.clone(),
             optional: v.optional,
         }))
+    }
+
+    fn incremental_state(&self) -> Option<IncrementalState> {
+        self.incremental.clone()
     }
 }
 
@@ -3056,6 +3381,90 @@ mod test {
         }
     }
 
+    #[test]
+    fn test_incremental_predecessor_arguments_ignore_cargo_artifact_identity() {
+        let first = parses!(
+            "--crate-name",
+            "probe",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,link",
+            "-C",
+            "metadata=first",
+            "-C",
+            "extra-filename=-first",
+            "--out-dir",
+            "/builder-a/target/deps",
+            "--extern",
+            "dep=/builder-a/target/deps/libdep-first.rmeta",
+            "-C",
+            "opt-level=2"
+        );
+        let second = parses!(
+            "--crate-name",
+            "probe",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,link",
+            "-C",
+            "metadata=second",
+            "-C",
+            "extra-filename=-second",
+            "--out-dir",
+            "/builder-b/target/deps",
+            "--extern",
+            "dep=/builder-b/target/deps/libdep-second.rmeta",
+            "-C",
+            "opt-level=2"
+        );
+        let hash_arguments = |parsed: &ParsedArguments| {
+            let mut digest = Digest::new();
+            let skipped =
+                hash_incremental_arguments(&parsed.arguments, &parsed.input, false, &mut digest);
+            (digest.finish(), skipped)
+        };
+        let (first_hash, first_skipped) = hash_arguments(&first);
+        let (second_hash, second_skipped) = hash_arguments(&second);
+
+        assert_eq!(first_hash, second_hash);
+        assert_eq!(first_skipped, second_skipped);
+        assert_eq!(first_skipped.get("cargo-metadata-identity"), Some(&1));
+        assert_eq!(first_skipped.get("cargo-extra-filename"), Some(&1));
+        assert_eq!(first_skipped.get("extern-path"), Some(&1));
+        assert_eq!(first_skipped.get("output-directory"), Some(&1));
+
+        let changed_configuration = parses!(
+            "--crate-name",
+            "probe",
+            "src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit=dep-info,link",
+            "-C",
+            "metadata=second",
+            "-C",
+            "extra-filename=-second",
+            "--out-dir",
+            "/builder-b/target/deps",
+            "--extern",
+            "dep=/builder-b/target/deps/libdep-second.rmeta",
+            "-C",
+            "opt-level=3"
+        );
+        let (changed_hash, _) = hash_arguments(&changed_configuration);
+        assert_ne!(first_hash, changed_hash);
+        assert_eq!(
+            incremental_environment_skip_reason("CARGO_TARGET_DIR"),
+            Some("physical-target-directory")
+        );
+        assert_eq!(
+            incremental_environment_skip_reason("CARGO_FEATURE_FOO"),
+            None
+        );
+    }
+
     const TEST_RUSTC_VERSION: &str = r#"
 rustc 1.66.1 (90743e729 2023-01-10)
 binary: rustc
@@ -3282,6 +3691,25 @@ LLVM version: 15.0.2
             "incremental=/foo"
         );
         assert_eq!(r, CompilerArguments::CannotCache("incremental", None));
+        let enabled_args = [
+            "--emit",
+            "link",
+            "foo.rs",
+            "--out-dir",
+            "out",
+            "--crate-name",
+            "foo",
+            "--crate-type",
+            "lib",
+            "-C",
+            "incremental=/foo",
+        ]
+        .map(OsString::from);
+        let enabled = parse_arguments_with_incremental(&enabled_args, Path::new("/"), true);
+        let CompilerArguments::Ok(enabled) = enabled else {
+            panic!("opted-in incremental arguments were rejected");
+        };
+        assert_eq!(enabled.incremental, Some(PathBuf::from("/foo")));
     }
 
     #[test]
@@ -3957,6 +4385,8 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
                 crate_link_paths: vec![],
+                input: "foo.rs".into(),
+                incremental: None,
                 staticlibs: vec![f.tempdir.path().join("libbaz.a")],
                 crate_name: "foo".into(),
                 crate_types: CrateTypes {

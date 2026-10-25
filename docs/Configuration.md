@@ -186,6 +186,7 @@ Note that some env variables may need sccache server restart to take effect.
 
 ### misc
 
+* `SCCACHE_RUST_INCREMENTAL=1` enables experimental Rust incremental snapshot support. Cross-checkout reuse additionally requires rustc with the `remap-cwd-prefix` incremental fix and one constant `-Z remap-cwd-prefix=<logical-root>` flag for every checkout; this is an unstable rustc option. The cache must be trusted because restored compiler state is parsed by rustc. Incremental compilations are kept local and are not sent to the distributed compiler. See [Rust incremental snapshots](RustIncrementalSnapshots.md) for the exact Cargo configuration.
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths will cause an error and prevent the server from start.
@@ -196,6 +197,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_MAX_FRAME_LENGTH` how much data can be transferred between client and server
 * `SCCACHE_NO_DAEMON` set to `1` to disable putting the server to the background
 * `SCCACHE_CLIENT_SIDE` set to `1` to run the compile in the client process and use the daemon only as a gateway to the cache storage (see [the architecture doc](Architecture.md#client-side-mode-sccache_client_side)). This is the recommended mode and is expected to become the only supported configuration in the future. Ignored when `SCCACHE_ERROR_LOG` or distributed compilation is in use.
+* `SCCACHE_IN_PROCESS=1` runs each compile directly against the configured cache backend in the wrapper process, without starting or contacting the daemon. This supports sandboxes that allow the cache directory but deny local IPC; it requires no sandbox policy changes. Cache statistics are process-local and are not accumulated by the daemon in this mode.
 * `SCCACHE_SKIP_CACHE_CHECK` set to `true`, `on`, or `1` to skip remote cache capability checks. The configured backend `rw_mode` is used without reading or writing `.sccache_check`. The user is responsible for ensuring that the cache is reachable and grants the configured access.
 * `SCCACHE_CACHE_MULTIARCH` set (to any value, even `0`) to enable caching of builds with several different `-arch` flags, which are not cached by default. See [the caching doc](Caching.md#cc-compiler).
 * `SCCACHE_CACHE_ZSTD_LEVEL` to set zstd compression level of cache. the range is `1-22` and default is `3`.
