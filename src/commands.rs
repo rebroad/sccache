@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::cache::readonly::ReadOnlyStorage;
-use crate::cache::{CacheMode, IpcStorage, Storage, storage_from_config};
+use crate::cache::{
+    CacheMode, IpcStorage, Storage, storage_from_config, storage_from_config_in_process,
+};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::{ColorMode, is_rmeta_artifact_notification};
@@ -26,7 +28,7 @@ use crate::util::{daemonize, new_client_runtime, run_input_output};
 use byteorder::{BigEndian, ByteOrder};
 use fs::{File, OpenOptions};
 use fs_err as fs;
-use log::Level::Trace;
+use log::{Level::Trace, warn};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
@@ -803,6 +805,7 @@ pub fn do_compile_in_process<C>(
     runtime: &mut Runtime,
     storage: Arc<dyn Storage>,
     cache_mode: CacheMode,
+    cache_dir: &Path,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -835,7 +838,7 @@ where
     };
     let (compile_resp, finished, forwarded_notification) =
         runtime.block_on(service.compile_direct(compile, &mut *stderr))?;
-    if matches!(compile_resp, CompileResponse::UnhandledCompile) {
+    let exit_code = if matches!(compile_resp, CompileResponse::UnhandledCompile) {
         // Run unsupported compiler invocations directly. In isolated
         // environments Tokio may not reap a compiler child reliably, while
         // std::process::Command::status waits synchronously without IPC.
@@ -845,25 +848,32 @@ where
             .envs(env_vars)
             .status()
             .context("failed to execute unhandled compile")?;
-        return Ok(status.code().unwrap_or_else(|| {
+        status.code().unwrap_or_else(|| {
             if let Some(signal) = status_signal(status) {
                 println!("sccache: Compiler killed by signal {}", signal);
             }
             2
-        }));
+        })
+    } else {
+        handle_compile_result(
+            C::new(jobserver),
+            runtime,
+            compile_resp,
+            finished,
+            forwarded_notification,
+            &exe_path,
+            cmdline,
+            cwd,
+            stdout,
+            stderr,
+        )?
+    };
+    let mut stats = runtime.block_on(service.take_stats());
+    stats.compile_requests += 1;
+    if let Err(error) = crate::in_process_stats::add(cache_dir, stats) {
+        warn!("failed to record in-process statistics: {error:#}");
     }
-    handle_compile_result(
-        C::new(jobserver),
-        runtime,
-        compile_resp,
-        finished,
-        forwarded_notification,
-        &exe_path,
-        cmdline,
-        cwd,
-        stdout,
-        stderr,
-    )
+    Ok(exit_code)
 }
 
 /// Run `cmd` and return the process exit status.
@@ -876,16 +886,22 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     match cmd {
         Command::ShowStats(fmt, advanced) => {
             trace!("Command::ShowStats({:?})", fmt);
-            let (stats, effective_cache_mode) = match connect_to_server(&get_addr()) {
-                Ok(srv) => {
-                    let (info, cache_mode) = request_stats_with_cache_mode(srv)
-                        .context("failed to get stats from server")?;
-                    (info, Some(cache_mode))
+            let in_process_mode = env::var("SCCACHE_IN_PROCESS").is_ok_and(|value| value == "1");
+            let (mut stats, effective_cache_mode) = if in_process_mode {
+                (empty_server_info(config)?, None)
+            } else {
+                match connect_to_server(&get_addr()) {
+                    Ok(srv) => {
+                        let (info, cache_mode) = request_stats_with_cache_mode(srv)
+                            .context("failed to get stats from server")?;
+                        (info, Some(cache_mode))
+                    }
+                    // If there is no server, spawning a new server would start with zero stats
+                    // anyways, so we can just return (mostly) empty stats directly.
+                    Err(_) => (empty_server_info(config)?, None),
                 }
-                // If there is no server, spawning a new server would start with zero stats
-                // anyways, so we can just return (mostly) empty stats directly.
-                Err(_) => (empty_server_info(config)?, None),
             };
+            stats.stats += crate::in_process_stats::read(&config.fallback_cache.dir)?;
             match fmt {
                 StatsFormat::Text => stats.print(advanced, effective_cache_mode),
                 StatsFormat::Json => serde_json::to_writer(
@@ -955,8 +971,13 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
-            request_zero_stats(conn).context("couldn't zero stats on server")?;
+            if env::var("SCCACHE_IN_PROCESS").is_ok_and(|value| value == "1") {
+                crate::in_process_stats::zero(&config.fallback_cache.dir)?;
+            } else {
+                let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+                request_zero_stats(conn).context("couldn't zero stats on server")?;
+                crate::in_process_stats::zero(&config.fallback_cache.dir)?;
+            }
             eprintln!("Statistics zeroed.");
         }
         #[cfg(feature = "dist-client")]
@@ -1079,7 +1100,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     .worker_threads(2)
                     .enable_all()
                     .build()?;
-                let storage = storage_from_config(config, runtime.handle())?;
+                let storage = storage_from_config_in_process(config, runtime.handle())?;
                 let cache_mode = runtime.block_on(storage.check())?;
                 let storage: Arc<dyn Storage> = match cache_mode {
                     CacheMode::ReadOnly => Arc::new(ReadOnlyStorage(storage)),
@@ -1090,6 +1111,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &mut runtime,
                     storage,
                     cache_mode,
+                    &config.fallback_cache.dir,
                     exe.as_ref(),
                     cmdline,
                     &cwd,

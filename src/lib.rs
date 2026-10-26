@@ -40,6 +40,7 @@ mod commands;
 mod compiler;
 pub mod config;
 pub mod dist;
+mod in_process_stats;
 mod jobserver;
 pub mod lru_disk_cache;
 mod mock_command;
@@ -48,6 +49,10 @@ mod protocol;
 pub mod server;
 #[doc(hidden)]
 pub mod util;
+
+// For benches/sccache_bench.rs.
+#[doc(hidden)]
+pub use compiler::PreprocessorCacheEntry;
 
 use std::env;
 
