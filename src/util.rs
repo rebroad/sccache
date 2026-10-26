@@ -1092,7 +1092,7 @@ pub fn daemonize(_preserve_fds: &[std::os::windows::io::RawHandle]) -> Result<()
     Ok(())
 }
 
-#[cfg(all(feature = "reqwest", not(target_os = "android")))]
+#[cfg(feature = "reqwest")]
 fn mozilla_root_certificates() -> reqwest::Result<Vec<reqwest::Certificate>> {
     webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
@@ -1100,30 +1100,29 @@ fn mozilla_root_certificates() -> reqwest::Result<Vec<reqwest::Certificate>> {
         .collect()
 }
 
-/// Create an async reqwest client builder using the platform verifier, augmented with
-/// Mozilla roots when the verifier supports additional trust anchors.
+/// Create an async reqwest client builder with trusted root certificates.
 #[cfg(feature = "reqwest")]
 pub(crate) fn new_reqwest_client_builder() -> reqwest::Result<reqwest::ClientBuilder> {
     let builder = reqwest::Client::builder();
 
-    // rustls-platform-verifier's Android backend intentionally has no
-    // `new_with_extra_roots`; adding roots there makes reqwest fail at build time.
+    // The Android platform verifier requires a JVM context, which this CLI does
+    // not have. Use the bundled Mozilla roots directly instead.
     #[cfg(target_os = "android")]
-    return Ok(builder);
+    return Ok(builder.tls_certs_only(mozilla_root_certificates()?));
 
     #[cfg(not(target_os = "android"))]
     Ok(builder.tls_certs_merge(mozilla_root_certificates()?))
 }
 
-/// Create a blocking reqwest client builder using the platform verifier, augmented with
-/// Mozilla roots when the verifier supports additional trust anchors.
+/// Create a blocking reqwest client builder with trusted root certificates.
 #[cfg(any_dist)]
 pub(crate) fn new_reqwest_blocking_builder() -> reqwest::Result<reqwest::blocking::ClientBuilder> {
     let builder = reqwest::blocking::Client::builder();
 
-    // See `new_reqwest_client_builder`: Android cannot merge extra verifier roots.
+    // The Android platform verifier requires a JVM context, which this CLI does
+    // not have. Use the bundled Mozilla roots directly instead.
     #[cfg(target_os = "android")]
-    return Ok(builder);
+    return Ok(builder.tls_certs_only(mozilla_root_certificates()?));
 
     #[cfg(not(target_os = "android"))]
     Ok(builder.tls_certs_merge(mozilla_root_certificates()?))
@@ -1678,6 +1677,12 @@ mod tests {
                 super::new_reqwest_blocking_client().map(drop)
             },
         )
+    }
+
+    #[cfg(all(any_dist, target_os = "android"))]
+    #[test]
+    fn android_blocking_http_client_builds_without_jvm_context() -> reqwest::Result<()> {
+        super::new_reqwest_blocking_client().map(drop)
     }
 
     #[test]
