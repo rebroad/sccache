@@ -831,10 +831,27 @@ where
         exe: exe_path.as_os_str().to_owned(),
         cwd: cwd.as_os_str().to_owned(),
         args: cmdline.clone(),
-        env_vars,
+        env_vars: env_vars.clone(),
     };
     let (compile_resp, finished, forwarded_notification) =
         runtime.block_on(service.compile_direct(compile, &mut *stderr))?;
+    if matches!(compile_resp, CompileResponse::UnhandledCompile) {
+        // Run unsupported compiler invocations directly. In isolated
+        // environments Tokio may not reap a compiler child reliably, while
+        // std::process::Command::status waits synchronously without IPC.
+        let status = process::Command::new(&exe_path)
+            .args(&cmdline)
+            .current_dir(cwd)
+            .envs(env_vars)
+            .status()
+            .context("failed to execute unhandled compile")?;
+        return Ok(status.code().unwrap_or_else(|| {
+            if let Some(signal) = status_signal(status) {
+                println!("sccache: Compiler killed by signal {}", signal);
+            }
+            2
+        }));
+    }
     handle_compile_result(
         C::new(jobserver),
         runtime,
@@ -1055,7 +1072,13 @@ pub fn run_command(cmd: Command) -> Result<i32> {
 
             let jobserver = Client::new();
             if env::var("SCCACHE_IN_PROCESS").is_ok_and(|value| value == "1") {
-                let mut runtime = new_client_runtime()?;
+                // In-process compile fallback waits for child processes while the
+                // runtime is blocked. Keep a worker thread available to drive the
+                // process driver and reap the compiler in restricted environments.
+                let mut runtime = Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()?;
                 let storage = storage_from_config(config, runtime.handle())?;
                 let cache_mode = runtime.block_on(storage.check())?;
                 let storage: Arc<dyn Storage> = match cache_mode {
