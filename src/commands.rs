@@ -817,7 +817,6 @@ pub fn do_compile_in_process<C>(
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
-    trace!("do_compile_in_process");
     let exe_path = which_in(exe, path, cwd)?;
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
